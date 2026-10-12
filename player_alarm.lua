@@ -295,7 +295,7 @@ end
 local tracks = {}       -- radar tracks, positioned relative to the base
 local seenShips = {}
 local shipHistory = {}  -- [id] = { x, z, t, vx, vz } for measuring speed and heading
-local shipNumbers, nextShipNumber = {}, 1
+local shipNumbers, nextNumber = {}, {}  -- numbered per kind: SHIP 1, SHIP 2, TRAIN 1
 local MODES = { "players", "threats", "all" }
 local mode = readFile(DIR .. "/mode", nil)
 
@@ -319,6 +319,24 @@ local function baseCenter()
 end
 
 local function isShip(cat) return cat == "SABLE" or cat == "CONTRAPTION" end
+
+local SHIP_COLOR = { 70, 215, 255 }      -- Sable ships
+local CONTRAPTION_COLOR = { 200, 140, 255 }  -- Create contraptions and trains
+
+local function prettyType(id)
+  if not id or id == "" then return "Unknown" end
+  local name = id:gsub("^[^:]+:", ""):gsub("_", " ")
+  return (name:gsub("(%a)(%w*)", function(a, b) return a:upper() .. b end))
+end
+
+-- Short label and color for a moving structure: Sable ship vs Create contraption.
+local function vesselKind(e)
+  if e.category == "SABLE" then return "SHIP", SHIP_COLOR end
+  local t = (e.entityType or ""):lower()
+  if t:find("carriage") or t:find("train") then return "TRAIN", CONTRAPTION_COLOR end
+  if t:find("gantry") then return "GANTRY", CONTRAPTION_COLOR end
+  return "CONTRAPTION", CONTRAPTION_COLOR
+end
 
 local function scanRadars()
   if #radars == 0 then
@@ -364,8 +382,10 @@ local function scanRadars()
     if isShip(e.category) then
       if not seenShips[e.id] then
         local where = e.dist and (meters(e.dist) .. " " .. compass(e.dx, e.dz)) or "in range"
-        event("Ship on radar, " .. where, "info")
-        if SHIP_WARN then warnAllowed("Ship detected " .. where, "Radar") end
+        local kind = vesselKind(e)
+        local word = kind:sub(1, 1) .. kind:sub(2):lower()
+        event(word .. " on radar, " .. where, "info")
+        if SHIP_WARN then warnAllowed(word .. " detected " .. where, "Radar") end
       end
       seenShips[e.id] = t
     end
@@ -379,8 +399,9 @@ local function scanRadars()
   for _, e in ipairs(out) do
     if isShip(e.category) and e.dx then
       if not shipNumbers[e.id] then
-        shipNumbers[e.id] = nextShipNumber
-        nextShipNumber = nextShipNumber + 1
+        local kind = vesselKind(e)
+        nextNumber[kind] = (nextNumber[kind] or 0) + 1
+        shipNumbers[e.id] = nextNumber[kind]
       end
       e.number = shipNumbers[e.id]
       local h = shipHistory[e.id]
@@ -442,14 +463,15 @@ local function shipSpeedText(e)
 end
 
 local function radarSummary()
-  local ships, hostile, unknown, other = 0, 0, 0, 0
+  local ships, hostile, unknown, other, contraptions = 0, 0, 0, 0, 0
   for _, e in ipairs(tracks) do
-    if isShip(e.category) then ships = ships + 1
+    if e.category == "SABLE" then ships = ships + 1
+    elseif e.category == "CONTRAPTION" then contraptions = contraptions + 1
     elseif e.category == "HOSTILE" then hostile = hostile + 1
     elseif e.category == "PLAYER" and not e.name then unknown = unknown + 1
     else other = other + 1 end
   end
-  return ships, hostile, unknown, other
+  return ships, hostile, unknown, other, contraptions
 end
 
 local function scan()
@@ -692,7 +714,8 @@ local gpuError = nil
 local view = "radar"     -- "radar" or "log"
 local viewAt = 0
 local zoom = RANGE        -- radar scale in blocks (view only)
-local selected = nil      -- player whose details are shown
+local selected = nil      -- player name, or "track:<id>" for a radar track
+local radarHits = {}      -- { x, y, key } for everything drawn on the radar this frame
 local gpuButtons = {}
 local function gpuButton(x, y, w, h, action)
   table.insert(gpuButtons, { x = x, y = y, w = w, h = h, action = action })
@@ -791,6 +814,7 @@ local function blipAngle(e)
 end
 
 local function drawRadar(cx, cy, r, small)
+  radarHits = {}
   circle(cx, cy, r, { 10, 22, 17 }, true)
   for i = 1, 4 do
     circle(cx, cy, r * i / 4, (i == 4) and GRID or GRID2, false)
@@ -838,6 +862,9 @@ local function drawRadar(cx, cy, r, small)
           line(bx, by, bx + v.x * k, by + v.z * k, PROJ)
         end
       end
+      local key = "track:" .. t.id
+      if not isShip(c) then table.insert(radarHits, { x = bx, y = by, key = key }) end
+      if key == selected then circle(bx, by, 8, WHITE, false) end
       if isShip(c) then
         -- drawn in their own pass below so they sit on top
       elseif c == "PROJECTILE" then
@@ -853,12 +880,26 @@ local function drawRadar(cx, cy, r, small)
     end
   end
 
+  local placed = {}
+  local function freeY(lx, ly, lw, lh)
+    for _ = 1, 6 do
+      local hit = false
+      for _, b in ipairs(placed) do
+        if lx < b.x + b.w and lx + lw > b.x and ly < b.y + b.h and ly + lh > b.y then hit = true break end
+      end
+      if not hit then break end
+      ly = ly + lh
+    end
+    table.insert(placed, { x = lx, y = ly, w = lw, h = lh })
+    return ly
+  end
   -- Ships: a filled hull pointing where it's heading, a fading wake behind,
   -- a dashed line to where it'll be in 5 seconds, and a label.
-  local SHIPC = { 70, 215, 255 }
-  local SHIPDARK = { 20, 70, 95 }
   for _, t in ipairs(visibleTracks()) do
     if isShip(t.category) and t.dist and t.dx then
+      local kind, SHIPC = vesselKind(t)
+      local SHIPDARK = mix({ 0, 0, 0 }, SHIPC, 0.35)
+      local isSable = t.category == "SABLE"
       local a = screenAngle(t.dx, t.dz)
       local d = math.min(1, t.dist / zoom) * (r - 6)
       local bx, by = cx + math.cos(a) * d, cy + math.sin(a) * d
@@ -880,46 +921,60 @@ local function drawRadar(cx, cy, r, small)
           line(x0, y0, x1, y1, SHIPC)
         end
       end
-      -- hull: nose, then the stern corners, filled with a fan of lines
-      local nx, ny = pt(11 * scale, 0)
-      local stern = { { -7, -6 }, { -9, -3 }, { -9, 3 }, { -7, 6 } }
-      for i = 1, #stern - 1 do
-        local ax, ay = stern[i][1] * scale, stern[i][2] * scale
-        local bx2, by2 = stern[i + 1][1] * scale, stern[i + 1][2] * scale
-        for s2 = 0, 8 do
-          local fx = ax + (bx2 - ax) * s2 / 8
-          local fy = ay + (by2 - ay) * s2 / 8
-          local px, py = pt(fx, fy)
-          line(nx, ny, px, py, SHIPDARK)
+      if isSable then
+        -- Sable ship: pointed hull, filled with a fan of lines
+        local nx, ny = pt(11 * scale, 0)
+        local stern = { { -7, -6 }, { -9, -3 }, { -9, 3 }, { -7, 6 } }
+        for i = 1, #stern - 1 do
+          local ax, ay = stern[i][1] * scale, stern[i][2] * scale
+          local bx2, by2 = stern[i + 1][1] * scale, stern[i + 1][2] * scale
+          for s2 = 0, 8 do
+            local fx = ax + (bx2 - ax) * s2 / 8
+            local fy = ay + (by2 - ay) * s2 / 8
+            local px, py = pt(fx, fy)
+            line(nx, ny, px, py, SHIPDARK)
+          end
+        end
+        local prevx, prevy = nx, ny
+        for _, sp in ipairs(stern) do
+          local px, py = pt(sp[1] * scale, sp[2] * scale)
+          line(prevx, prevy, px, py, SHIPC)
+          prevx, prevy = px, py
+        end
+        line(prevx, prevy, nx, ny, SHIPC)
+      else
+        -- Create contraption: a square frame with a cross, like a crate, turned with its heading
+        local hs = 7 * scale
+        for i = -hs, hs, 1 do
+          local x0, y0 = pt(-hs, i)
+          local x1, y1 = pt(hs, i)
+          line(x0, y0, x1, y1, SHIPDARK)
+        end
+        local c1x, c1y = pt(-hs, -hs)
+        local c2x, c2y = pt(hs, -hs)
+        local c3x, c3y = pt(hs, hs)
+        local c4x, c4y = pt(-hs, hs)
+        line(c1x, c1y, c2x, c2y, SHIPC) line(c2x, c2y, c3x, c3y, SHIPC)
+        line(c3x, c3y, c4x, c4y, SHIPC) line(c4x, c4y, c1x, c1y, SHIPC)
+        line(c1x, c1y, c3x, c3y, SHIPC) line(c2x, c2y, c4x, c4y, SHIPC)
+        if moving then
+          local fx, fy = pt(hs + 4, 0)
+          circle(fx, fy, 2, SHIPC, true)
         end
       end
-      local prevx, prevy = nx, ny
-      for _, sp in ipairs(stern) do
-        local px, py = pt(sp[1] * scale, sp[2] * scale)
-        line(prevx, prevy, px, py, SHIPC)
-        prevx, prevy = px, py
-      end
-      line(prevx, prevy, nx, ny, SHIPC)
-      local label = "SHIP " .. (t.number or "?")
-      text(label, bx + 14, by - small, SHIPC, small * 0.9, "bold")
-      text(meters(t.dist) .. "  " .. shipSpeedText(t), bx + 14, by, SHIPC, small * 0.75)
+      local key = "track:" .. t.id
+      table.insert(radarHits, { x = bx, y = by, key = key })
+      if key == selected then circle(bx, by, 16, WHITE, false) end
+      local label = kind .. " " .. (t.number or "?")
+      local sub = meters(t.dist) .. "  " .. shipSpeedText(t)
+      local lw = math.max(textWidth(label, small * 0.9, "bold"), textWidth(sub, small * 0.75))
+      local ly = freeY(bx + 14, by - small, lw, small * 2)
+      text(label, bx + 14, ly, SHIPC, small * 0.9, "bold")
+      text(sub, bx + 14, ly + small, SHIPC, small * 0.75)
     end
   end
 
   -- Blips: allowed players green, intruders red with a pulse ring
-  local placed = {}
-  local function freeY(lx, ly, lw, lh)
-    for _ = 1, 6 do
-      local hit = false
-      for _, b in ipairs(placed) do
-        if lx < b.x + b.w and lx + lw > b.x and ly < b.y + b.h and ly + lh > b.y then hit = true break end
-      end
-      if not hit then break end
-      ly = ly + lh
-    end
-    table.insert(placed, { x = lx, y = ly, w = lw, h = lh })
-    return ly
-  end
   for _, e in ipairs(nearbyList()) do
     if e.dist then
       local a = blipAngle(e)
@@ -927,6 +982,7 @@ local function drawRadar(cx, cy, r, small)
       local d = math.min(1, e.dist / zoom) * (r - 6)
       local bx, by = cx + math.cos(a) * d, cy + math.sin(a) * d
       if e.name == selected then circle(bx, by, 9, WHITE, false) end
+      table.insert(radarHits, { x = bx, y = by, key = e.name })
       if outside then
         circle(bx, by, 4, e.allowed and GREEN or RED, false)
       elseif e.allowed then
@@ -983,14 +1039,54 @@ local function detailLines(e)
   return lines
 end
 
+local function trackDetails(t)
+  local lines = {}
+  local title, color
+  if isShip(t.category) then
+    local kind, c = vesselKind(t)
+    title, color = kind .. " " .. (t.number or "?"), c
+    local what = t.category == "SABLE" and "Sable ship" or "Create contraption"
+    local typeName = prettyType(t.entityType)
+    if typeName ~= "Ship" and typeName ~= "Unknown" then what = what .. " (" .. typeName .. ")" end
+    table.insert(lines, what)
+  elseif t.category == "PLAYER" then
+    title, color = "Unknown player", AMBER
+    table.insert(lines, "beyond the detector, name unknown")
+  else
+    title = prettyType(t.entityType)
+    color = (t.category == "HOSTILE" and { 245, 120, 50 }) or (t.category == "PROJECTILE" and { 250, 220, 70 }) or MUTED
+    table.insert(lines, prettyType(t.category):lower())
+  end
+  if t.dist then
+    table.insert(lines, meters(t.dist) .. " away, " .. compass(t.dx, t.dz))
+    local c = baseCenter()
+    if c then
+      table.insert(lines, "at " .. math.floor(c.x + t.dx) .. ", " .. math.floor(c.y + t.dy) .. ", " .. math.floor(c.z + t.dz))
+    end
+  end
+  if isShip(t.category) then
+    if t.speed and t.speed >= 0.3 then
+      table.insert(lines, "moving " .. shipSpeedText(t) .. " toward " .. compass(t.vx, t.vz))
+    else
+      table.insert(lines, "parked")
+    end
+  end
+  return title, color, lines
+end
+
 local function drawDetails(e, x, bottom, w, small, medium)
-  local lines = detailLines(e)
+  local lines, title, color
+  if e.track then
+    title, color, lines = trackDetails(e.track)
+  else
+    lines, title, color = detailLines(e), e.name, e.allowed and GREEN or RED
+  end
   local rowH = small + 5
   local h = medium + 12 + #lines * rowH + 4
   local y = bottom - h
   rect(x, y, w, h, PANEL)
-  rect(x, y, 4, h, e.allowed and GREEN or RED)
-  text(fit(e.name, w - 44, medium, "bold"), x + 12, y + 6, WHITE, medium, "bold")
+  rect(x, y, 4, h, color)
+  text(fit(title, w - 44, medium, "bold"), x + 12, y + 6, WHITE, medium, "bold")
   pill(x + w - 30, y + 4, 26, medium + 4, "X", { 50, 56, 66 }, WHITE, small, function() selected = nil end)
   for i, l in ipairs(lines) do
     text(fit(l, w - 20, small), x + 12, y + medium + 12 + (i - 1) * rowH, MUTED, small)
@@ -1152,8 +1248,26 @@ local function drawGpu()
   -- Radar, with the selected player's details over its lower half
   local r = math.min((W - pad * 2) / 2, H * 0.21)
   drawRadar(W / 2, y + r, r, small)
+  -- Tap a blip for details; tap empty radar to close them.
+  local rcx, rcy = W / 2, y + r
+  gpuButton(rcx - r, rcy - r, r * 2, r * 2, function(px, py)
+    local best, bestD = nil, 18
+    for _, h in ipairs(radarHits) do
+      local d = math.sqrt((h.x - px) ^ 2 + (h.y - py) ^ 2)
+      if d < bestD then best, bestD = h.key, d end
+    end
+    selected = (best and best ~= selected) and best or nil
+  end)
   if selected then
-    local e = present[selected]
+    local e
+    if selected:sub(1, 6) == "track:" then
+      local id = selected:sub(7)
+      for _, t in ipairs(tracks) do
+        if t.id == id then e = { track = t } end
+      end
+    else
+      e = present[selected]
+    end
     if e then
       drawDetails(e, pad * 2, y + r * 2, W - pad * 4, small, medium)
     else
@@ -1167,8 +1281,14 @@ local function drawGpu()
   text("NEARBY", pad * 1.6, y + pad / 2, MUTED, small, "bold")
   local hdr = "view " .. zoom .. "m"
   if #radars > 0 then
-    local ships, hostile, unknown = radarSummary()
-    hdr = ships .. " ships, " .. hostile .. " hostile" .. (unknown > 0 and (", " .. unknown .. " unknown") or "") .. "  |  " .. hdr
+    local ships, hostile, unknown, _, contraptions = radarSummary()
+    local parts = {}
+    if ships > 0 then table.insert(parts, ships .. (ships == 1 and " ship" or " ships")) end
+    if contraptions > 0 then table.insert(parts, contraptions .. " contr.") end
+    if hostile > 0 then table.insert(parts, hostile .. " hostile") end
+    if unknown > 0 then table.insert(parts, unknown .. " unknown") end
+    if #parts == 0 then table.insert(parts, "radar clear") end
+    hdr = table.concat(parts, ", ") .. "  |  " .. hdr
   end
   textRight(fit(hdr, W * 0.7, small), W - pad * 1.6, y + pad / 2, MUTED, small)
   y = y + small + pad + 2
@@ -1202,16 +1322,19 @@ local function drawGpu()
     text("+" .. (#list - maxNearby) .. " more nearby", pad * 1.6, y + 2, MUTED, small)
     y = y + small + 6
   end
-  local SHIPC = { 70, 215, 255 }
   for i = 1, math.min(2, #ships) do
     local e = ships[i]
+    local kind, SHIPC = vesselKind(e)
+    local key = "track:" .. e.id
+    if key == selected then rect(pad, y - 2, W - pad * 2, rowH, { 32, 37, 46 }) end
+    gpuButton(pad, y - 2, W - pad * 2, rowH, function() selected = (selected ~= key) and key or nil end)
     rect(pad, y, 4, rowH - 4, SHIPC)
-    text("SHIP " .. (e.number or "?"), pad * 1.6, y + 2, SHIPC, medium, "bold")
+    text(kind .. " " .. (e.number or "?"), pad * 1.6, y + 2, SHIPC, medium, "bold")
     textRight(meters(e.dist) .. " " .. compass(e.dx, e.dz) .. "  " .. shipSpeedText(e), W - pad * 1.6, y + 2, SHIPC, medium, "bold")
     y = y + rowH
   end
   if #ships > 2 then
-    text("+" .. (#ships - 2) .. " more ships", pad * 1.6, y + 2, MUTED, small)
+    text("+" .. (#ships - 2) .. " more on radar", pad * 1.6, y + 2, MUTED, small)
     y = y + small + 6
   end
   y = y + pad / 2
@@ -1366,7 +1489,8 @@ local function drawStatusTab(y)
     local ships, hostile, unknown = radarSummary()
     dot(27, y, baseCenter() ~= nil, "Radar", currentMode())
     y = y + 1
-    put(4, y, ("Radar x" .. #radars .. ": " .. ships .. " ship " .. hostile .. " hostile " .. unknown .. " unknown"):sub(1, TW - 4), colors.lightBlue)
+    local _, _, _, _, contraptions = radarSummary()
+    put(4, y, ("Radar x" .. #radars .. ": " .. ships .. " ship " .. contraptions .. " contr " .. hostile .. " hostile " .. unknown .. " unknown"):sub(1, TW - 4), colors.lightBlue)
   else
     dot(27, y, false, "Radar", "none")
   end
@@ -1610,7 +1734,7 @@ local function tap(px, py)
   for i = #gpuButtons, 1, -1 do
     local b = gpuButtons[i]
     if px >= b.x and px <= b.x + b.w and py >= b.y and py <= b.y + b.h then
-      b.action()
+      b.action(px, py)
       return
     end
   end
