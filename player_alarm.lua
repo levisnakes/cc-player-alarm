@@ -18,6 +18,7 @@ UNLOCK_SECONDS = 60       -- right-click the detector to unlock MUTE on the moni
 UTC_OFFSET = 0            -- hours added to server time for the log (e.g. -5)
 
 DISCORD_WEBHOOK = nil     -- paste a Discord webhook URL here (in quotes) to post alerts to a channel
+RADAR_UP = "east"         -- which direction is at the top of the radar: "north", "east", "south" or "west"
 RADAR_MODE = "auto"       -- radar view: "players", "threats" or "all"; "auto" = threats when a Create Radar is found
 SHIP_WARN = false         -- toast the allowed list when a new ship shows up on the radar
 
@@ -773,10 +774,17 @@ local function setupGpu()
   return true
 end
 
+-- World direction (dx east, dz south) to a screen angle, turned so RADAR_UP
+-- points at the top of the radar.
+local UP_TURN = { north = 0, east = math.pi / 2, south = math.pi, west = -math.pi / 2 }
+local function screenAngle(dx, dz)
+  return math.atan2(dz, dx) - (UP_TURN[RADAR_UP] or 0)
+end
+
 -- Blip position: real direction when the detector is calibrated, otherwise a
 -- steady angle per name at the measured distance.
 local function blipAngle(e)
-  if e.dx and e.dz then return math.atan2(e.dz, e.dx) end
+  if e.dx and e.dz then return screenAngle(e.dx, e.dz) end
   local h = 0
   for i = 1, #e.name do h = (h * 31 + e.name:byte(i)) % 3600 end
   return h / 3600 * 2 * math.pi
@@ -793,7 +801,14 @@ local function drawRadar(cx, cy, r, small)
     text(math.floor(zoom * i / 4) .. "m", cx + 3, cy - r * i / 4 + 1, GRID, small * 0.85)
   end
   if detectorPos then
-    text("N", cx - textWidth("N", small, "bold") / 2, cy - r + 3, GRID, small, "bold")
+    -- compass letters just inside the rim, turned with the radar
+    for _, d in ipairs({ { "N", 0, -1 }, { "E", 1, 0 }, { "S", 0, 1 }, { "W", -1, 0 } }) do
+      local a = screenAngle(d[2], d[3])
+      local lw = textWidth(d[1], small, "bold")
+      local lx = cx + math.cos(a) * (r - small) - lw / 2
+      local ly = cy + math.sin(a) * (r - small) - small / 2
+      text(d[1], lx, ly, d[1] == "N" and { 200, 70, 60 } or GRID, small, "bold")
+    end
   end
 
   -- Sweep with a fading trail
@@ -812,7 +827,7 @@ local function drawRadar(cx, cy, r, small)
   local UNKNOWN = { 240, 172, 52 }
   for _, t in ipairs(visibleTracks()) do
     if t.dist and t.dx then
-      local a = math.atan2(t.dz, t.dx)
+      local a = screenAngle(t.dx, t.dz)
       local d = math.min(1, t.dist / zoom) * (r - 6)
       local bx, by = cx + math.cos(a) * d, cy + math.sin(a) * d
       local c = t.category
@@ -844,11 +859,11 @@ local function drawRadar(cx, cy, r, small)
   local SHIPDARK = { 20, 70, 95 }
   for _, t in ipairs(visibleTracks()) do
     if isShip(t.category) and t.dist and t.dx then
-      local a = math.atan2(t.dz, t.dx)
+      local a = screenAngle(t.dx, t.dz)
       local d = math.min(1, t.dist / zoom) * (r - 6)
       local bx, by = cx + math.cos(a) * d, cy + math.sin(a) * d
       local moving = t.speed and t.speed >= 0.3
-      local hd = moving and math.atan2(t.vz, t.vx) or -math.pi / 2
+      local hd = moving and screenAngle(t.vx, t.vz) or -math.pi / 2
       local ch, sh = math.cos(hd), math.sin(hd)
       local function pt(fx, fy) return bx + fx * ch - fy * sh, by + fx * sh + fy * ch end
       local scale = 1.3

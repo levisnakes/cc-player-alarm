@@ -34,7 +34,7 @@ Radar players standing where the detector sees someone get that player's name an
 
 ## Monitor controls
 
-- **- / +**: zoom the radar (view only).
+- **- / +**: zoom the radar (view only). East is at the top by default; `RADAR_UP` turns it (north, east, south or west), with N/E/S/W marked on the rim.
 - **MODE**: radar view mode (needs a Create Radar).
 - **LOG**: full visit log with repeat visitors; **BACK** returns.
 - **Tap a player** in the Nearby list: their coordinates, direction, time here, closest distance and past visits.
