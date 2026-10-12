@@ -1,0 +1,832 @@
+-- Player Alarm: warns when someone who isn't on the allowed list comes near.
+-- Uses an Advanced Peripherals Player Detector. Shows a radar and visit log
+-- on a monitor (full color with DirectGPU), logs every visit with time,
+-- duration and closest distance, and can sound a redstone alarm, ring a
+-- speaker and message allowed players through a Chat Box.
+
+ALLOWED = { "YourName" }  -- players who never trigger the alarm (case doesn't matter)
+RANGE = 64                -- detection radius in blocks (server max is 512)
+SCAN_SECONDS = 1          -- how often to check
+LEAVE_GRACE = 15          -- seconds out of range before a visit counts as over
+CLOSE_WARNING = 16        -- warn again if an intruder gets this close
+
+ALARM_SIDE = "bottom"     -- redstone on while an intruder is near; nil = off
+CHAT_WARN = true          -- message online allowed players through a Chat Box
+UTC_OFFSET = 0            -- hours added to server time for the log (e.g. -5)
+
+MONITOR = nil             -- nil = the biggest monitor attached
+TITLE = "BASE SECURITY"
+
+
+-- ============================================================ basics
+
+local DIR = "/pwarn"
+local function now() return os.epoch("utc") / 1000 end
+
+local function readFile(path, default)
+  if not fs.exists(path) then return default end
+  local f = fs.open(path, "r")
+  local data = textutils.unserialize(f.readAll())
+  f.close()
+  if data == nil then return default end
+  return data
+end
+
+local function writeFile(path, data)
+  local tmp = path .. ".tmp"
+  local f = fs.open(tmp, "w")
+  f.write(textutils.serialize(data))
+  f.close()
+  if fs.exists(path) then fs.delete(path) end
+  fs.move(tmp, path)
+end
+
+local function fmtDuration(s)
+  s = math.max(0, math.floor(s))
+  if s >= 3600 then return string.format("%dh %02dm", math.floor(s / 3600), math.floor(s / 60) % 60) end
+  if s >= 60 then return string.format("%dm %02ds", math.floor(s / 60), s % 60) end
+  return s .. "s"
+end
+
+local function fmtWhen(t)
+  return os.date("!%m/%d %H:%M", math.floor(t + UTC_OFFSET * 3600))
+end
+
+local function clockText()
+  return os.date("!%H:%M", math.floor(now() + UTC_OFFSET * 3600))
+end
+
+local DIRS = { "N", "NE", "E", "SE", "S", "SW", "W", "NW" }
+local function compass(dx, dz)
+  local a = math.deg(math.atan2(dx, -dz)) % 360
+  return DIRS[math.floor((a + 22.5) / 45) % 8 + 1]
+end
+
+-- ============================================================ saved data
+
+if not fs.exists(DIR) then fs.makeDir(DIR) end
+
+local allowed = readFile(DIR .. "/allowed", nil)
+if not allowed then
+  allowed = {}
+  for _, n in ipairs(ALLOWED) do allowed[n:lower()] = n end
+end
+local function saveAllowed() writeFile(DIR .. "/allowed", allowed) end
+local function isAllowed(name) return allowed[name:lower()] ~= nil end
+
+local visits = readFile(DIR .. "/visits", {})      -- finished visits, newest last
+local active = readFile(DIR .. "/active", {})      -- [name] = visit in progress
+local stats = readFile(DIR .. "/stats", {})        -- [name] = { visits, seconds, closest, last }
+local detectorPos = readFile(DIR .. "/detector", nil)
+
+local function saveVisits() writeFile(DIR .. "/visits", visits) end
+local function saveActive() writeFile(DIR .. "/active", active) end
+local function saveStats() writeFile(DIR .. "/stats", stats) end
+
+-- ============================================================ peripherals
+
+local detector, chat, speaker
+local function findPeripherals()
+  detector = peripheral.find("player_detector") or peripheral.find("playerDetector")
+  chat = peripheral.find("chat_box") or peripheral.find("chatBox")
+  speaker = peripheral.find("speaker")
+end
+
+local function dcall(method, ...)
+  if not detector then return false, "no detector" end
+  return pcall(detector[method], ...)
+end
+
+-- ============================================================ scanning
+
+local present = {}      -- [name] = { name, allowed, dist, dx, dz, y, dim }
+local scanError = nil
+local lastScan = 0
+
+-- Exact distance without knowing where the detector is: binary search on range.
+local function measureDistance(name)
+  local ok, inside = dcall("isPlayerInRange", RANGE, name)
+  if not ok or not inside then return nil end
+  local lo, hi = 0, RANGE
+  while hi - lo > 1 do
+    local mid = math.floor((lo + hi) / 2)
+    local okM, r = dcall("isPlayerInRange", mid, name)
+    if okM and r then hi = mid else lo = mid end
+  end
+  return hi
+end
+
+local function playerInfo(name)
+  local ok, p = dcall("getPlayer", name)
+  if not ok or type(p) ~= "table" then ok, p = dcall("getPlayerPos", name) end
+  if ok and type(p) == "table" and p.x then return p end
+  return nil
+end
+
+local function locate(name)
+  local info = playerInfo(name)
+  local e = { name = name, allowed = isAllowed(name) }
+  if info then e.dim = info.dimension end
+  if info and detectorPos then
+    e.dx = info.x - detectorPos.x
+    e.dy = info.y - detectorPos.y
+    e.dz = info.z - detectorPos.z
+    e.dist = math.sqrt(e.dx * e.dx + e.dy * e.dy + e.dz * e.dz)
+  else
+    e.dist = measureDistance(name)
+  end
+  return e
+end
+
+-- ============================================================ alerts
+
+local chatQueue = {}
+local alertFlash = 0
+
+local function warnAllowed(text, title)
+  if not CHAT_WARN or not chat then return end
+  local ok, online = dcall("getOnlinePlayers")
+  if not ok or type(online) ~= "table" then return end
+  for _, p in ipairs(online) do
+    if isAllowed(p) then table.insert(chatQueue, { player = p, text = text, title = title }) end
+  end
+end
+
+local function ring()
+  if not speaker then return end
+  for i = 1, 3 do
+    pcall(speaker.playNote, "bell", 3, 18)
+    sleep(0.15)
+  end
+end
+
+local log = {}  -- recent events for the screen
+local function event(text, kind)
+  table.insert(log, 1, { t = now(), text = text, kind = kind })
+  while #log > 8 do table.remove(log) end
+end
+
+local function onArrive(v)
+  local where = v.dist and (math.floor(v.dist) .. "m") or "in range"
+  event(v.name .. " arrived (" .. where .. ")", "alert")
+  warnAllowed("Intruder " .. v.name .. " is " .. where .. " from base", "Intruder alert")
+  alertFlash = now() + 6
+  view = "radar"
+end
+
+local function onClose(v)
+  event(v.name .. " is " .. math.floor(v.dist) .. "m away", "alert")
+  warnAllowed(v.name .. " is getting close: " .. math.floor(v.dist) .. "m", "Intruder close")
+  alertFlash = now() + 6
+end
+
+local function onLeave(v)
+  local dur = v.last - v.first
+  local closest = v.closest and (math.floor(v.closest) .. "m") or "?"
+  event(v.name .. " left after " .. fmtDuration(dur) .. ", closest " .. closest, "info")
+  warnAllowed(v.name .. " left after " .. fmtDuration(dur) .. " (closest " .. closest .. ")", "Intruder left")
+  table.insert(visits, { name = v.name, first = v.first, last = v.last, closest = v.closest })
+  while #visits > 500 do table.remove(visits, 1) end
+  local s = stats[v.name:lower()] or { name = v.name, visits = 0, seconds = 0 }
+  s.visits = s.visits + 1
+  s.seconds = s.seconds + dur
+  s.last = v.last
+  if v.closest and (not s.closest or v.closest < s.closest) then s.closest = v.closest end
+  stats[v.name:lower()] = s
+  saveVisits()
+  saveStats()
+end
+
+local function scan()
+  if not detector then
+    scanError = "No Player Detector found"
+    return
+  end
+  local ok, names = dcall("getPlayersInRange", RANGE)
+  if not ok or type(names) ~= "table" then
+    scanError = "Detector error: " .. tostring(names)
+    return
+  end
+  scanError = nil
+
+  -- Locate everyone in range at once so the checks land in the same ticks.
+  local found = {}
+  local tasks = {}
+  for _, name in ipairs(names) do
+    tasks[#tasks + 1] = function() found[name] = locate(name) end
+  end
+  if #tasks > 0 then parallel.waitForAll(table.unpack(tasks)) end
+  present = found
+
+  local t = now()
+  local changed = false
+  for name, e in pairs(found) do
+    if not e.allowed then
+      local v = active[name]
+      if not v then
+        v = { name = name, first = t, last = t, closest = e.dist, warnedClose = false }
+        active[name] = v
+        v.dist = e.dist
+        onArrive(v)
+      end
+      v.last = t
+      v.dist = e.dist
+      if e.dist and (not v.closest or e.dist < v.closest) then v.closest = e.dist end
+      if e.dist and e.dist <= CLOSE_WARNING and not v.warnedClose then
+        v.warnedClose = true
+        onClose(v)
+      end
+      changed = true
+    end
+  end
+  for name, v in pairs(active) do
+    if not found[name] and t - v.last > LEAVE_GRACE then
+      active[name] = nil
+      onLeave(v)
+      changed = true
+    elseif found[name] and found[name].allowed then
+      -- added to the allowed list mid-visit
+      active[name] = nil
+      changed = true
+    end
+  end
+  if changed then saveActive() end
+  lastScan = t
+
+  if ALARM_SIDE then rs.setOutput(ALARM_SIDE, next(active) ~= nil) end
+end
+
+local function scanLoop()
+  findPeripherals()
+  local rang = {}
+  while true do
+    local ok, err = pcall(scan)
+    if not ok then scanError = tostring(err) end
+    for name, v in pairs(active) do
+      if not rang[name] then
+        rang[name] = true
+        ring()
+      end
+    end
+    for name in pairs(rang) do if not active[name] then rang[name] = nil end end
+    sleep(SCAN_SECONDS)
+  end
+end
+
+local function chatLoop()
+  while true do
+    local msg = table.remove(chatQueue, 1)
+    if msg and chat then
+      local okT = pcall(chat.sendToast, { message = msg.text, title = msg.title, player = msg.player, prefix = "Security" })
+      if not okT then
+        pcall(chat.sendMessage, msg.text, { player = msg.player, prefix = "Security" })
+      end
+      sleep(1.1)  -- the chat box has a 1 second cooldown
+    else
+      sleep(0.5)
+    end
+  end
+end
+
+local function peripheralLoop()
+  while true do
+    local ev = os.pullEvent()
+    if ev == "peripheral" or ev == "peripheral_detach" then findPeripherals() end
+  end
+end
+
+-- ============================================================ shared view data
+
+local function nearbyList()
+  local list = {}
+  for _, e in pairs(present) do table.insert(list, e) end
+  table.sort(list, function(a, b)
+    if a.allowed ~= b.allowed then return not a.allowed end
+    return (a.dist or 1e9) < (b.dist or 1e9)
+  end)
+  return list
+end
+
+local function intruderCount()
+  local n = 0
+  for _ in pairs(active) do n = n + 1 end
+  return n
+end
+
+local function todayCount()
+  local dayStart = math.floor((now() + UTC_OFFSET * 3600) / 86400) * 86400 - UTC_OFFSET * 3600
+  local n = 0
+  for _, v in ipairs(visits) do if v.first >= dayStart then n = n + 1 end end
+  for _, v in pairs(active) do if v.first >= dayStart then n = n + 1 end end
+  return n
+end
+
+-- ============================================================ DirectGPU screen
+
+local gpu, display, W, H
+local view = "radar"     -- "radar" or "log"; tap the monitor to switch
+local viewAt = 0
+
+local FONT = "SansSerif"
+local BG = { 12, 14, 18 }
+local PANEL = { 24, 28, 35 }
+local GRID = { 30, 70, 52 }
+local GRID2 = { 22, 48, 38 }
+local SWEEP = { 70, 230, 150 }
+local MUTED = { 135, 144, 158 }
+local WHITE = { 236, 239, 244 }
+local GREEN = { 62, 200, 110 }
+local RED = { 236, 74, 66 }
+local DARKRED = { 120, 28, 26 }
+local AMBER = { 240, 172, 52 }
+
+local function I(v) return math.floor(v + 0.5) end
+local function rect(x, y, w, h, c)
+  if w <= 0 or h <= 0 then return end
+  gpu.fillRect(display, I(x), I(y), I(w), I(h), c[1], c[2], c[3])
+end
+local function text(s, x, y, c, size, style)
+  gpu.drawText(display, s, I(x), I(y), c[1], c[2], c[3], FONT, I(size), style or "plain")
+end
+local widthCache = {}
+local function textWidth(s, size, style)
+  local key = s .. "|" .. I(size) .. "|" .. (style or "")
+  if not widthCache[key] then
+    local m = gpu.measureText(s, FONT, I(size), style or "plain")
+    widthCache[key] = (m and m.width) or #s * size * 0.55
+  end
+  return widthCache[key]
+end
+local function fit(s, maxW, size, style)
+  if textWidth(s, size, style) <= maxW then return s end
+  while #s > 1 and textWidth(s .. "..", size, style) > maxW do s = s:sub(1, -2) end
+  return s .. ".."
+end
+local function textRight(s, right, y, c, size, style) text(s, right - textWidth(s, size, style), y, c, size, style) end
+local function line(x1, y1, x2, y2, c) gpu.drawLine(display, I(x1), I(y1), I(x2), I(y2), c[1], c[2], c[3]) end
+local function circle(cx, cy, r, c, filled) gpu.drawCircle(display, I(cx), I(cy), I(r), c[1], c[2], c[3], filled) end
+local function mix(a, b, t)
+  return { I(a[1] + (b[1] - a[1]) * t), I(a[2] + (b[2] - a[2]) * t), I(a[3] + (b[3] - a[3]) * t) }
+end
+
+local function findMonitor()
+  if MONITOR then return MONITOR end
+  local best, area = nil, 0
+  for _, name in ipairs(peripheral.getNames()) do
+    if peripheral.hasType(name, "monitor") then
+      local ok, w, h = pcall(peripheral.call, name, "getSize")
+      if ok and w * h > area then best, area = name, w * h end
+    end
+  end
+  return best
+end
+
+local function setupGpu()
+  gpu = peripheral.find("directgpu")
+  local mon = findMonitor()
+  if not gpu or not mon then return false end
+  local ok, id = pcall(gpu.autoDetectAndCreateDisplay, mon, 1)
+  if not ok then return false end
+  display = id
+  local info = gpu.getDisplayInfo(display)
+  if info.pixelWidth < 400 then
+    local res = math.min(4, math.ceil(400 / info.pixelWidth))
+    local ok2, id2 = pcall(gpu.autoDetectAndCreateDisplay, mon, res)
+    if ok2 then display = id2 info = gpu.getDisplayInfo(display) end
+  end
+  W, H = info.pixelWidth, info.pixelHeight
+  pcall(gpu.setDisplayPersistent, display, true)
+  return true
+end
+
+-- Blip position: real direction when the detector is calibrated, otherwise a
+-- steady angle per name at the measured distance.
+local function blipAngle(e)
+  if e.dx and e.dz then return math.atan2(e.dz, e.dx) end
+  local h = 0
+  for i = 1, #e.name do h = (h * 31 + e.name:byte(i)) % 3600 end
+  return h / 3600 * 2 * math.pi
+end
+
+local function drawRadar(cx, cy, r, small)
+  circle(cx, cy, r, { 10, 22, 17 }, true)
+  for i = 1, 4 do
+    circle(cx, cy, r * i / 4, (i == 4) and GRID or GRID2, false)
+  end
+  line(cx - r, cy, cx + r, cy, GRID2)
+  line(cx, cy - r, cx, cy + r, GRID2)
+  for i = 1, 3 do
+    text(math.floor(RANGE * i / 4) .. "m", cx + 3, cy - r * i / 4 + 1, GRID, small * 0.85)
+  end
+  if detectorPos then
+    text("N", cx - textWidth("N", small, "bold") / 2, cy - r + 3, GRID, small, "bold")
+  end
+
+  -- Sweep with a fading trail
+  local a0 = (now() * 1.6) % (2 * math.pi)
+  for k = 14, 0, -1 do
+    local a = a0 - k * 0.045
+    local c = mix({ 10, 22, 17 }, SWEEP, (1 - k / 15) ^ 2)
+    line(cx, cy, cx + math.cos(a) * r, cy + math.sin(a) * r, c)
+  end
+
+  -- Blips: allowed players green, intruders red with a pulse ring
+  for _, e in ipairs(nearbyList()) do
+    if e.dist then
+      local a = blipAngle(e)
+      local d = math.min(1, e.dist / RANGE) * (r - 6)
+      local bx, by = cx + math.cos(a) * d, cy + math.sin(a) * d
+      if e.allowed then
+        circle(bx, by, 3, GREEN, true)
+      else
+        local pulse = 5 + (now() * 8) % 8
+        circle(bx, by, pulse, DARKRED, false)
+        circle(bx, by, 4, RED, true)
+      end
+      -- Allowed players label to the left, intruders to the right, so close blips don't overlap.
+      local label = e.name
+      local lw = textWidth(label, small * 0.9)
+      local lx = e.allowed and (bx - 7 - lw) or (bx + 7)
+      if lx + lw > cx + r then lx = bx - 7 - lw end
+      if lx < cx - r then lx = bx + 7 end
+      text(label, lx, by - small * 0.5, e.allowed and GREEN or RED, small * 0.9, e.allowed and "plain" or "bold")
+    end
+  end
+  circle(cx, cy, 3, WHITE, true)
+end
+
+local function drawLogPage()
+  local pad = math.max(8, math.floor(W * 0.03))
+  local small = math.max(10, math.floor(W * 0.03))
+  local medium = math.max(12, math.floor(W * 0.04))
+  local big = math.max(16, math.floor(W * 0.06))
+
+  gpu.clear(display, BG[1], BG[2], BG[3])
+  local headH = big + pad * 2
+  rect(0, 0, W, headH, PANEL)
+  text("VISIT LOG", pad, pad - 1, WHITE, big, "bold")
+  textRight(todayCount() .. " today", W - pad, (headH - medium) / 2, MUTED, medium)
+  local y = headH + pad
+
+  -- Repeat visitors
+  local people = {}
+  for _, st in pairs(stats) do table.insert(people, st) end
+  table.sort(people, function(a, b)
+    if a.visits ~= b.visits then return a.visits > b.visits end
+    return (a.last or 0) > (b.last or 0)
+  end)
+  rect(pad, y, W - pad * 2, small + pad, PANEL)
+  text("VISITORS", pad * 1.6, y + pad / 2, MUTED, small, "bold")
+  textRight("visits   time   closest", W - pad * 1.6, y + pad / 2, MUTED, small)
+  y = y + small + pad + 2
+  local rowH = small + 7
+  for i = 1, math.min(5, #people) do
+    local st = people[i]
+    text(fit(st.name, W * 0.4, small, "bold"), pad * 1.6, y + 2, WHITE, small, "bold")
+    local right = st.visits .. "   " .. fmtDuration(st.seconds) .. "   " .. (st.closest and (math.floor(st.closest) .. "m") or "?")
+    textRight(right, W - pad * 1.6, y + 2, AMBER, small)
+    y = y + rowH
+  end
+  if #people == 0 then
+    text("Nobody yet", pad * 1.6, y + 2, MUTED, small)
+    y = y + rowH
+  end
+  y = y + pad / 2
+
+  -- Every visit, newest first
+  rect(pad, y, W - pad * 2, small + pad, PANEL)
+  text("WHEN", pad * 1.6, y + pad / 2, MUTED, small, "bold")
+  text("WHO", pad * 1.6 + textWidth("00/00 00:00  ", small), y + pad / 2, MUTED, small, "bold")
+  textRight("STAYED  CLOSEST", W - pad * 1.6, y + pad / 2, MUTED, small, "bold")
+  y = y + small + pad + 2
+  local rows = math.floor((H - small - pad * 2 - y) / rowH)
+  for i = 0, rows - 1 do
+    local v = visits[#visits - i]
+    if not v then break end
+    local yy = y + i * rowH
+    if i % 2 == 0 then rect(pad, yy - 1, W - pad * 2, rowH, { 18, 21, 27 }) end
+    text(fmtWhen(v.first), pad * 1.6, yy + 2, MUTED, small)
+    text(fit(v.name, W * 0.33, small, "bold"), pad * 1.6 + textWidth("00/00 00:00  ", small), yy + 2, WHITE, small, "bold")
+    textRight(fmtDuration(v.last - v.first) .. "  " .. (v.closest and (math.floor(v.closest) .. "m") or "?"), W - pad * 1.6, yy + 2, AMBER, small)
+  end
+  if #visits == 0 then text("No visits logged yet", pad * 1.6, y + 2, MUTED, small) end
+
+  text("Tap to go back", pad, H - small - pad / 2, MUTED, small)
+  gpu.updateDisplay(display)
+end
+
+local function drawGpu()
+  if view == "log" then return drawLogPage() end
+  local pad = math.max(8, math.floor(W * 0.03))
+  local small = math.max(10, math.floor(W * 0.03))
+  local medium = math.max(12, math.floor(W * 0.04))
+  local big = math.max(16, math.floor(W * 0.06))
+  local intruders = intruderCount()
+
+  gpu.clear(display, BG[1], BG[2], BG[3])
+
+  -- Header
+  local headH = big + pad * 2
+  rect(0, 0, W, headH, PANEL)
+  text(TITLE, pad, pad - 1, WHITE, big, "bold")
+  textRight(clockText(), W - pad, (headH - medium) / 2, WHITE, medium, "bold")
+
+  -- Status banner
+  local y = headH + pad
+  local bannerH = big + pad * 2
+  if scanError then
+    rect(pad, y, W - pad * 2, bannerH, AMBER)
+    text(fit(scanError, W - pad * 4, medium, "bold"), pad * 2, y + (bannerH - medium) / 2, BG, medium, "bold")
+  elseif intruders > 0 then
+    local flash = (math.floor(now() * 2) % 2 == 0) and RED or DARKRED
+    rect(pad, y, W - pad * 2, bannerH, flash)
+    local msg = intruders == 1 and "INTRUDER ALERT" or (intruders .. " INTRUDERS")
+    local mw = textWidth(msg, big, "bold")
+    text(msg, (W - mw) / 2, y + (bannerH - big) / 2 - 1, WHITE, big, "bold")
+  else
+    rect(pad, y, W - pad * 2, bannerH, { 22, 70, 44 })
+    local msg = "SECURE"
+    local mw = textWidth(msg, big, "bold")
+    text(msg, (W - mw) / 2, y + (bannerH - big) / 2 - 1, GREEN, big, "bold")
+  end
+  y = y + bannerH + pad
+
+  -- Radar
+  local r = math.min((W - pad * 2) / 2, H * 0.23)
+  drawRadar(W / 2, y + r, r, small)
+  y = y + r * 2 + pad
+
+  -- Nearby players
+  rect(pad, y, W - pad * 2, small + pad, PANEL)
+  text("NEARBY", pad * 1.6, y + pad / 2, MUTED, small, "bold")
+  textRight("range " .. RANGE .. "m", W - pad * 1.6, y + pad / 2, MUTED, small)
+  y = y + small + pad + 2
+  local list = nearbyList()
+  local rowH = medium + 8
+  local maxNearby = math.max(1, math.min(4, #list))
+  if #list == 0 then
+    text("Nobody in range", pad * 1.6, y + 4, MUTED, medium)
+    y = y + rowH
+  end
+  for i = 1, maxNearby do
+    local e = list[i]
+    if not e then break end
+    local c = e.allowed and GREEN or RED
+    rect(pad, y, 4, rowH - 4, c)
+    text(fit(e.name, W * 0.42, medium, "bold"), pad * 1.6, y + 2, WHITE, medium, "bold")
+    local info = e.dist and (math.floor(e.dist) .. "m") or "?"
+    if e.dx then info = info .. " " .. compass(e.dx, e.dz) end
+    local v = active[e.name]
+    if v then info = info .. "  " .. fmtDuration(now() - v.first) end
+    textRight(info, W - pad * 1.6, y + 2, c, medium, "bold")
+    y = y + rowH
+  end
+  y = y + pad / 2
+
+  -- Visit log
+  rect(pad, y, W - pad * 2, small + pad, PANEL)
+  text("VISIT LOG", pad * 1.6, y + pad / 2, MUTED, small, "bold")
+  textRight(todayCount() .. " today, " .. #visits .. " total", W - pad * 1.6, y + pad / 2, MUTED, small)
+  y = y + small + pad + 2
+  local footH = small + pad
+  local logRow = small + 7
+  local rows = math.floor((H - footH - y) / logRow)
+  if #visits == 0 then text("No visits logged yet", pad * 1.6, y + 2, MUTED, small) end
+  for i = 0, rows - 1 do
+    local v = visits[#visits - i]
+    if not v then break end
+    local yy = y + i * logRow
+    if i % 2 == 0 then rect(pad, yy - 1, W - pad * 2, logRow, { 18, 21, 27 }) end
+    text(fmtWhen(v.first), pad * 1.6, yy + 2, MUTED, small)
+    text(fit(v.name, W * 0.33, small, "bold"), pad * 1.6 + textWidth("00/00 00:00  ", small), yy + 2, WHITE, small, "bold")
+    local right = fmtDuration(v.last - v.first) .. "  " .. (v.closest and (math.floor(v.closest) .. "m") or "?")
+    textRight(right, W - pad * 1.6, yy + 2, AMBER, small)
+  end
+
+  -- Footer: latest event
+  local fy = H - footH
+  rect(0, fy, W, footH, PANEL)
+  local ev = log[1]
+  if ev then
+    text(fit(os.date("!%H:%M", math.floor(ev.t + UTC_OFFSET * 3600)) .. "  " .. ev.text, W - pad * 2, small), pad, fy + (footH - small) / 2 - 1, ev.kind == "alert" and RED or MUTED, small)
+  else
+    text("Tap for the full visit log", pad, fy + (footH - small) / 2 - 1, MUTED, small)
+  end
+
+  gpu.updateDisplay(display)
+end
+
+-- ============================================================ plain monitor fallback
+
+local function drawPlain()
+  local name = findMonitor()
+  local mon = name and peripheral.wrap(name)
+  if not mon then return end
+  mon.setTextScale(0.5)
+  local w, h = mon.getSize()
+  mon.setBackgroundColour(colours.black)
+  mon.clear()
+  local function at(x, y, s, c, bg)
+    mon.setCursorPos(x, y)
+    mon.setBackgroundColour(bg or colours.black)
+    mon.setTextColour(c or colours.white)
+    mon.write(s)
+  end
+  at(1, 1, TITLE, colours.white)
+  at(w - 4, 1, clockText(), colours.lightGrey)
+  local intruders = intruderCount()
+  local banner = scanError or ((intruders > 0) and (intruders .. " INTRUDER" .. (intruders > 1 and "S" or "")) or "SECURE")
+  local bg = scanError and colours.orange or ((intruders > 0) and colours.red or colours.green)
+  at(1, 3, string.rep(" ", w), colours.white, bg)
+  at(math.max(1, math.floor((w - #banner) / 2) + 1), 3, banner:sub(1, w), colours.white, bg)
+  local y = 5
+  at(1, y, "NEARBY", colours.grey)
+  y = y + 1
+  for _, e in ipairs(nearbyList()) do
+    if y > 12 then break end
+    local info = (e.dist and (math.floor(e.dist) .. "m") or "?") .. (e.dx and (" " .. compass(e.dx, e.dz)) or "")
+    at(1, y, e.name:sub(1, w - #info - 2), e.allowed and colours.lime or colours.red)
+    at(w - #info + 1, y, info, e.allowed and colours.lime or colours.red)
+    y = y + 1
+  end
+  y = y + 1
+  at(1, y, "VISIT LOG (" .. todayCount() .. " today)", colours.grey)
+  y = y + 1
+  for i = 0, h - y do
+    local v = visits[#visits - i]
+    if not v then break end
+    local right = fmtDuration(v.last - v.first) .. " " .. (v.closest and (math.floor(v.closest) .. "m") or "?")
+    at(1, y, (fmtWhen(v.first) .. " " .. v.name):sub(1, w - #right - 1), colours.white)
+    at(w - #right + 1, y, right, colours.orange)
+    y = y + 1
+  end
+end
+
+-- ============================================================ computer screen
+
+local TW, TH = term.getSize()
+local buttons = {}
+local message = nil
+
+local function put(x, y, s, fg, bg)
+  term.setCursorPos(x, y)
+  term.setBackgroundColor(bg or colors.black)
+  term.setTextColor(fg or colors.white)
+  term.write(s)
+end
+local function button(x, y, label, bg, action)
+  label = " " .. label .. " "
+  put(x, y, label, colors.white, bg)
+  table.insert(buttons, { x = x, y = y, w = #label, action = action })
+  return x + #label + 1
+end
+
+local function calibrate()
+  local ok, names = dcall("getPlayersInRange", 2)
+  if not ok or type(names) ~= "table" or #names ~= 1 then
+    message = "Stand on the detector alone, then press Calibrate"
+    return
+  end
+  local info = playerInfo(names[1])
+  if not info then
+    message = "Couldn't read your position (getPlayer disabled?)"
+    return
+  end
+  detectorPos = { x = math.floor(info.x) + 0.5, y = math.floor(info.y) - 0.5, z = math.floor(info.z) + 0.5 }
+  writeFile(DIR .. "/detector", detectorPos)
+  message = "Calibrated: detector at " .. math.floor(detectorPos.x) .. ", " .. math.floor(detectorPos.y) .. ", " .. math.floor(detectorPos.z)
+end
+
+local function drawTerminal(useGpu)
+  buttons = {}
+  term.setBackgroundColor(colors.black)
+  term.clear()
+  put(1, 1, string.rep(" ", TW), colors.white, colors.gray)
+  put(2, 1, "PLAYER ALARM", colors.white, colors.gray)
+  local n = intruderCount()
+  put(TW - 10, 1, n > 0 and (n .. " INTRUDER") or "  SECURE  ", colors.white, n > 0 and colors.red or colors.green)
+
+  put(2, 3, "Detector: " .. (detector and "ok" or "missing") .. "   Chat box: " .. (chat and "ok" or "none") .. "   Speaker: " .. (speaker and "ok" or "none"), colors.lightGray)
+  put(2, 4, "Monitor: " .. (useGpu and "DirectGPU" or "plain") .. "   Direction: " .. (detectorPos and "calibrated" or "not calibrated"), colors.lightGray)
+  if scanError then put(2, 5, scanError, colors.red) end
+
+  local y = 6
+  put(2, y, "Nearby", colors.yellow)
+  y = y + 1
+  for _, e in ipairs(nearbyList()) do
+    if y > TH - 6 then break end
+    local info = e.dist and (math.floor(e.dist) .. "m") or "?"
+    put(2, y, e.name, e.allowed and colors.lime or colors.red)
+    put(20, y, info, colors.white)
+    if not e.allowed then
+      button(28, y, "Allow", colors.green, function()
+        allowed[e.name:lower()] = e.name
+        saveAllowed()
+        event(e.name .. " added to the allowed list", "info")
+        message = e.name .. " added to the allowed list"
+      end)
+    end
+    y = y + 1
+  end
+
+  y = y + 1
+  put(2, y, "Allowed:", colors.yellow)
+  local x = 11
+  local names = {}
+  for _, n2 in pairs(allowed) do table.insert(names, n2) end
+  table.sort(names)
+  for _, n2 in ipairs(names) do
+    if x + #n2 + 4 > TW then y = y + 1 x = 2 end
+    if y > TH - 2 then break end
+    put(x, y, n2, colors.lime)
+    x = x + #n2
+    x = button(x, y, "x", colors.red, function()
+      allowed[n2:lower()] = nil
+      saveAllowed()
+      message = n2 .. " removed"
+    end)
+  end
+
+  local bx = 2
+  bx = button(bx, TH - 1, "Calibrate", colors.blue, calibrate)
+  bx = button(bx, TH - 1, "Add name", colors.gray, function()
+    put(1, TH, string.rep(" ", TW), colors.white, colors.blue)
+    put(1, TH, "Name to allow: ", colors.white, colors.blue)
+    local name = read()
+    if name and name ~= "" then
+      allowed[name:lower()] = name
+      saveAllowed()
+      message = name .. " added"
+    end
+  end)
+  button(bx, TH - 1, "Clear log", colors.red, function()
+    visits = {}
+    saveVisits()
+    message = "Visit log cleared"
+  end)
+  if message then put(2, TH, message:sub(1, TW - 2), colors.orange) end
+end
+
+local useGpu = false
+
+local function displayLoop()
+  useGpu = setupGpu()
+  local retryAt = now() + 30
+  while true do
+    if view == "log" and now() - viewAt > 30 then view = "radar" end
+    if useGpu then
+      local ok = pcall(drawGpu)
+      if not ok then useGpu = false retryAt = now() + 30 end
+    end
+    if not useGpu then
+      pcall(drawPlain)
+      if now() >= retryAt then
+        useGpu = setupGpu()
+        retryAt = now() + 30
+      end
+    end
+    sleep(0.3)
+  end
+end
+
+local function terminalLoop()
+  local timer = os.startTimer(0.5)
+  while true do
+    drawTerminal(useGpu)
+    local ev, a, b, c = os.pullEvent()
+    if ev == "mouse_click" then
+      for _, btn in ipairs(buttons) do
+        if c == btn.y and b >= btn.x and b < btn.x + btn.w then
+          btn.action()
+          break
+        end
+      end
+    elseif ev == "timer" and a == timer then
+      timer = os.startTimer(0.5)
+    end
+  end
+end
+
+local function toggleView()
+  view = (view == "radar") and "log" or "radar"
+  viewAt = now()
+end
+
+local function touchLoop()
+  while true do
+    local timer = os.startTimer(0.2)
+    local ev = { os.pullEvent() }
+    if ev[1] == "monitor_touch" then toggleView() end
+    if useGpu and gpu and display then
+      local ok, has = pcall(gpu.hasEvents, display)
+      while ok and has do
+        local e = gpu.pollEvent(display)
+        if e and e.type == "mouse_click" then toggleView() end
+        ok, has = pcall(gpu.hasEvents, display)
+      end
+    end
+    if ev[1] ~= "timer" or ev[2] ~= timer then os.cancelTimer(timer) end
+  end
+end
+
+parallel.waitForAny(scanLoop, chatLoop, peripheralLoop, displayLoop, terminalLoop, touchLoop)
