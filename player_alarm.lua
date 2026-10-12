@@ -17,6 +17,9 @@ MUTE_MINUTES = 5          -- how long the MUTE button silences the siren and spe
 UNLOCK_SECONDS = 60       -- right-click the detector to unlock MUTE on the monitor
 UTC_OFFSET = 0            -- hours added to server time for the log (e.g. -5)
 
+RADAR_MODE = "auto"       -- radar view: "players", "threats" or "all"; "auto" = threats when a Create Radar is found
+SHIP_WARN = false         -- toast the allowed list when a new ship shows up on the radar
+
 MONITOR = nil             -- nil = the biggest monitor attached
 TITLE = "BASE SECURITY"
 AUTO_UPDATE = true        -- install new versions from GitHub automatically, keeping these settings
@@ -90,7 +93,34 @@ local function saveStats() writeFile(DIR .. "/stats", stats) end
 -- ============================================================ peripherals
 
 local detector, chat, speaker
+-- Create Radar: any radar bearing, plane radar or radar monitor on the
+-- computer or its cable. Found again whenever peripherals change.
+local radars = {}
+local radarRange = 0
+
+local function findRadars()
+  radars = {}
+  radarRange = 0
+  for _, name in ipairs(peripheral.getNames()) do
+    local isRadar = peripheral.hasType(name, "radar") or peripheral.hasType(name, "plane_radar")
+    if not isRadar and peripheral.hasType(name, "monitor") then
+      local ok, methods = pcall(peripheral.getMethods, name)
+      if ok and type(methods) == "table" then
+        for _, m in ipairs(methods) do
+          if m == "getSelectedTrackId" then isRadar = true break end
+        end
+      end
+    end
+    if isRadar then
+      table.insert(radars, name)
+      local ok, range = pcall(peripheral.call, name, "getRange")
+      if ok and type(range) == "number" then radarRange = math.max(radarRange, range) end
+    end
+  end
+end
+
 local function findPeripherals()
+  findRadars()
   detector = peripheral.find("player_detector") or peripheral.find("playerDetector")
   chat = peripheral.find("chat_box") or peripheral.find("chatBox")
   speaker = peripheral.find("speaker")
@@ -207,9 +237,124 @@ local function onLeave(v)
   saveStats()
 end
 
+local tracks = {}       -- radar tracks, positioned relative to the base
+local seenShips = {}
+local MODES = { "players", "threats", "all" }
+local mode = readFile(DIR .. "/mode", nil)
+
+local function currentMode()
+  if #radars == 0 then return "players" end
+  if mode then return mode end
+  if RADAR_MODE ~= "auto" then return RADAR_MODE end
+  return "threats"
+end
+
+-- Where radar tracks are measured from: the calibrated detector, or a plane
+-- radar's own position.
+local function baseCenter()
+  if detectorPos then return detectorPos end
+  for _, name in ipairs(radars) do
+    if peripheral.hasType(name, "plane_radar") then
+      local ok, pos = pcall(peripheral.call, name, "getPosition")
+      if ok and type(pos) == "table" and pos.x then return pos end
+    end
+  end
+end
+
+local function isShip(cat) return cat == "SABLE" or cat == "CONTRAPTION" end
+
+local function scanRadars()
+  if #radars == 0 then
+    tracks = {}
+    return
+  end
+  local center = baseCenter()
+  local byId = {}
+  for _, name in ipairs(radars) do
+    local ok, list = pcall(peripheral.call, name, "getTracks")
+    if ok and type(list) == "table" then
+      for _, t in pairs(list) do
+        if type(t) == "table" and t.id and type(t.position) == "table" then byId[t.id] = t end
+      end
+    end
+  end
+
+  local out = {}
+  for id, t in pairs(byId) do
+    local cat = t.category or "MISC"
+    if cat ~= "ITEM" then
+      local e = { id = id, category = cat, entityType = t.entityType, vel = t.velocity }
+      if center then
+        e.dx = t.position.x - center.x
+        e.dy = t.position.y - center.y
+        e.dz = t.position.z - center.z
+        e.dist = math.sqrt(e.dx * e.dx + e.dy * e.dy + e.dz * e.dz)
+      end
+      -- A radar player standing where the detector sees someone gets their name.
+      if cat == "PLAYER" and e.dx then
+        for name, p in pairs(present) do
+          if p.dx and (p.dx - e.dx) ^ 2 + (p.dy - e.dy) ^ 2 + (p.dz - e.dz) ^ 2 < 16 then
+            e.name, e.allowed = name, p.allowed
+          end
+        end
+      end
+      table.insert(out, e)
+    end
+  end
+
+  local t = now()
+  for _, e in ipairs(out) do
+    if isShip(e.category) then
+      if not seenShips[e.id] then
+        local where = e.dist and (math.floor(e.dist) .. "m " .. compass(e.dx, e.dz)) or "in range"
+        event("Ship on radar, " .. where, "info")
+        if SHIP_WARN then warnAllowed("Ship detected " .. where, "Radar") end
+      end
+      seenShips[e.id] = t
+    end
+  end
+  for id, at in pairs(seenShips) do
+    if t - at > 60 then seenShips[id] = nil end
+  end
+  tracks = out
+end
+
+-- Tracks shown in the current mode. Named players are already drawn from the detector.
+local function visibleTracks()
+  local m = currentMode()
+  local out = {}
+  if m == "players" then return out end
+  for _, e in ipairs(tracks) do
+    local c = e.category
+    local show
+    if c == "PLAYER" then
+      show = e.name == nil
+    elseif m == "threats" then
+      show = c == "HOSTILE" or c == "PROJECTILE" or isShip(c)
+    else
+      show = true
+    end
+    if show then table.insert(out, e) end
+  end
+  return out
+end
+
+local function radarSummary()
+  local ships, hostile, unknown, other = 0, 0, 0, 0
+  for _, e in ipairs(tracks) do
+    if isShip(e.category) then ships = ships + 1
+    elseif e.category == "HOSTILE" then hostile = hostile + 1
+    elseif e.category == "PLAYER" and not e.name then unknown = unknown + 1
+    else other = other + 1 end
+  end
+  return ships, hostile, unknown, other
+end
+
 local function scan()
   if not detector then
     scanError = "No Player Detector found"
+    present = {}
+    scanRadars()
     return
   end
   local ok, names = dcall("getPlayersInRange", RANGE)
@@ -262,6 +407,7 @@ local function scan()
   end
   if changed then saveActive() end
   lastScan = t
+  scanRadars()
 
   if ALARM_SIDE then rs.setOutput(ALARM_SIDE, next(active) ~= nil and not muted()) end
 end
@@ -462,6 +608,43 @@ local function drawRadar(cx, cy, r, small)
     line(cx, cy, cx + math.cos(a) * r, cy + math.sin(a) * r, c)
   end
 
+  -- Radar tracks
+  local SHIP = { 90, 160, 245 }
+  local HOST = { 245, 120, 50 }
+  local PROJ = { 250, 220, 70 }
+  local MOBC = { 120, 128, 140 }
+  local UNKNOWN = { 240, 172, 52 }
+  for _, t in ipairs(visibleTracks()) do
+    if t.dist and t.dx then
+      local a = math.atan2(t.dz, t.dx)
+      local d = math.min(1, t.dist / zoom) * (r - 6)
+      local bx, by = cx + math.cos(a) * d, cy + math.sin(a) * d
+      local c = t.category
+      if isShip(c) or c == "PROJECTILE" then
+        -- velocity arrow, length = where it'll be in 5 seconds
+        local v = t.vel
+        if type(v) == "table" and v.x then
+          local k = 100 / zoom * (r - 6)
+          local ex, ey = bx + v.x * k, by + v.z * k
+          line(bx, by, ex, ey, isShip(c) and SHIP or PROJ)
+        end
+      end
+      if isShip(c) then
+        for i = 0, 4 do line(bx - 5 + i, by - i, bx + 5 - i, by - i, SHIP) line(bx - 5 + i, by + i, bx + 5 - i, by + i, SHIP) end
+        text("ship", bx + 8, by - small * 0.5, SHIP, small * 0.8)
+      elseif c == "PROJECTILE" then
+        circle(bx, by, 2, PROJ, true)
+      elseif c == "HOSTILE" then
+        rect(bx - 3, by - 3, 6, 6, HOST)
+      elseif c == "PLAYER" then
+        circle(bx, by, 4, UNKNOWN, true)
+        text("?", bx + 7, by - small * 0.5, UNKNOWN, small * 0.9, "bold")
+      else
+        circle(bx, by, 2, MOBC, true)
+      end
+    end
+  end
+
   -- Blips: allowed players green, intruders red with a pulse ring
   for _, e in ipairs(nearbyList()) do
     if e.dist then
@@ -498,11 +681,12 @@ local function pill(x, y, w, h, label, bg, fg, size, action)
   if action then gpuButton(x, y, w, h, action) end
 end
 
-local ZOOMS = { 16, 32, 64, 128, 256, 512 }
+local ZOOMS = { 16, 32, 64, 128, 256, 512, 1024, 2048 }
 local function zoomStep(dir)
   local levels = {}
-  for _, z in ipairs(ZOOMS) do if z < RANGE then table.insert(levels, z) end end
-  table.insert(levels, RANGE)
+  local maxRange = math.max(RANGE, radarRange)
+  for _, z in ipairs(ZOOMS) do if z < maxRange then table.insert(levels, z) end end
+  table.insert(levels, maxRange)
   local idx = #levels
   for i, z in ipairs(levels) do if z == zoom then idx = i end end
   zoom = levels[math.max(1, math.min(#levels, idx + dir))]
@@ -645,9 +829,19 @@ local function drawGpu()
   local BTN = { 50, 56, 66 }
   pill(x, y, bw, tbH, "-", BTN, WHITE, medium, function() zoomStep(-1) end)
   x = x + bw + pad
-  pill(x, y, bw, tbH, zoom .. "m", PANEL, MUTED, small, nil)
-  x = x + bw + pad
   pill(x, y, bw, tbH, "+", BTN, WHITE, medium, function() zoomStep(1) end)
+  x = x + bw + pad
+  local m = currentMode()
+  pill(x, y, bw, tbH, m:upper(), #radars > 0 and { 40, 70, 110 } or { 40, 44, 52 }, #radars > 0 and WHITE or MUTED, small * 0.85, function()
+    if #radars == 0 then
+      event("Add a Create Radar for THREATS and ALL modes", "info")
+      return
+    end
+    local idx = 1
+    for i, v in ipairs(MODES) do if v == m then idx = i end end
+    mode = MODES[idx % #MODES + 1]
+    writeFile(DIR .. "/mode", mode)
+  end)
   x = x + bw + pad
   pill(x, y, bw, tbH, "LOG", BTN, WHITE, small, function() view = "log" viewAt = now() end)
   x = x + bw + pad
@@ -685,7 +879,12 @@ local function drawGpu()
   -- Nearby players
   rect(pad, y, W - pad * 2, small + pad, PANEL)
   text("NEARBY", pad * 1.6, y + pad / 2, MUTED, small, "bold")
-  textRight("range " .. RANGE .. "m", W - pad * 1.6, y + pad / 2, MUTED, small)
+  local hdr = "view " .. zoom .. "m"
+  if #radars > 0 then
+    local ships, hostile, unknown = radarSummary()
+    hdr = ships .. " ships, " .. hostile .. " hostile" .. (unknown > 0 and (", " .. unknown .. " unknown") or "") .. "  |  " .. hdr
+  end
+  textRight(fit(hdr, W * 0.7, small), W - pad * 1.6, y + pad / 2, MUTED, small)
   y = y + small + pad + 2
   local list = nearbyList()
   local rowH = medium + 8
@@ -838,6 +1037,11 @@ local function drawTerminal(useGpu)
   put(2, 3, "Detector: " .. (detector and "ok" or "missing") .. "   Chat box: " .. (chat and "ok" or "none") .. "   Speaker: " .. (speaker and "ok" or "none"), colors.lightGray)
   put(2, 4, "Monitor: " .. (useGpu and "DirectGPU" or "plain") .. "   Direction: " .. (detectorPos and "calibrated" or "not calibrated"), colors.lightGray)
   if muted() then put(2, 5, "Alarm muted for " .. fmtDuration(muteUntil - now()), colors.orange) end
+  if #radars > 0 then
+    local ships, hostile, unknown, other = radarSummary()
+    put(2, 5, "Radar x" .. #radars .. " " .. currentMode() .. ": " .. ships .. " ship " .. hostile .. " hostile " .. unknown .. " unknown", colors.lightBlue)
+    if not baseCenter() then put(2, 5, "Radar found: press Calibrate so tracks can be placed", colors.orange) end
+  end
   if scanError then put(2, 5, scanError, colors.red) end
 
   local y = 6
