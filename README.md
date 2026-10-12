@@ -10,7 +10,7 @@ ComputerCraft base security for an Advanced Peripherals Player Detector. When a 
 
 Every visit is logged with the time it started, how long it lasted and the closest the player got.
 
-Players in `WATCH_JOINS` (default: `Mechanoo`) are treated as enemies: when one comes online, every other online player gets a formatted **ENEMY DETECTED** chat message (the enemy doesn't), with a random line from `ENEMY_LINES`, and an amber ENEMY ONLINE bar shows on the monitor while they're on.
+Players in `WATCH_JOINS` (default: `Mechanoo`) are treated as enemies: when one comes online, every other online player gets a formatted **ENEMY DETECTED** chat message (the enemy doesn't), and an amber ENEMY ONLINE bar shows on the monitor while they're on.
 
 ## Discord
 

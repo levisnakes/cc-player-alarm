@@ -13,13 +13,6 @@ CLOSE_WARNING = 16        -- warn again if an intruder gets this close
 ALARM_SIDE = "bottom"     -- redstone on while an intruder is near; nil = off
 CHAT_WARN = true          -- toast online allowed players through a Chat Box
 WATCH_JOINS = { "Mechanoo" }  -- enemies: announced in chat to everyone else when they come online
-ENEMY_LINES = {                   -- one of these is picked at random for each announcement
-  "Lock the vaults. Man the cannons. Trust no one.",
-  "Hide your shells and guard your ships.",
-  "All hands to battle stations!",
-  "Watch your back. The enemy is among us.",
-  "Raise the shields and double the guards.",
-}
 MUTE_MINUTES = 5          -- how long the MUTE button silences the siren and speaker
 UNLOCK_SECONDS = 60       -- right-click the detector to unlock MUTE on the monitor
 UTC_OFFSET = 0            -- hours added to server time for the log (e.g. -5)
@@ -565,13 +558,11 @@ local watchedOnline = {}
 
 -- Minecraft chat JSON for the enemy announcement.
 local function enemyMessage(name, test)
-  local line = ENEMY_LINES[math.random(1, #ENEMY_LINES)]
   local SWORDS = "\226\154\148"  -- U+2694 crossed swords, as UTF-8 bytes
   local parts = {
     { text = SWORDS .. " ENEMY DETECTED " .. SWORDS .. "\n", color = "dark_red", bold = true },
     { text = name, color = "red", bold = true, underlined = true },
-    { text = " has entered the server.\n", color = "gray" },
-    { text = line, color = "gold", italic = true },
+    { text = " has entered the server.", color = "gray" },
   }
   if test then table.insert(parts, { text = "  (test, only the allowed list sees this)", color = "dark_gray", italic = true }) end
   -- unicode_strings turns the UTF-8 symbols into \u escapes Minecraft understands;
@@ -581,7 +572,7 @@ local function enemyMessage(name, test)
     parts[1].text = "!! ENEMY DETECTED !!\n"
     json = textutils.serializeJSON(parts)
   end
-  return json, "ENEMY DETECTED: " .. name .. " has entered the server. " .. line
+  return json, "ENEMY DETECTED: " .. name .. " has entered the server."
 end
 
 -- Send the enemy announcement only to allowed players who are online, as a test.
