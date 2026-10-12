@@ -18,6 +18,7 @@ UNLOCK_SECONDS = 60       -- right-click the detector to unlock MUTE on the moni
 UTC_OFFSET = 0            -- hours added to server time for the log (e.g. -5)
 
 DISCORD_WEBHOOK = nil     -- paste a Discord webhook URL here (in quotes) to post alerts to a channel
+DISCORD_MENTION = nil     -- who to ping, e.g. "<@&ROLE_ID>" for a role, "<@USER_ID>" or "@everyone"
 RADAR_UP = "east"         -- which direction is at the top of the radar: "north", "east", "south" or "west"
 RADAR_MODE = "auto"       -- radar view: "players", "threats" or "all"; "auto" = threats when a Create Radar is found
 SHIP_WARN = false         -- toast the allowed list when a new ship shows up on the radar
@@ -213,6 +214,8 @@ local function discordLoop()
     if msg then
       local body = textutils.serializeJSON({
         username = TITLE,
+        content = DISCORD_MENTION or "",
+        allowed_mentions = { parse = { "roles", "users", "everyone" } },
         embeds = { {
           title = msg.title,
           description = msg.text,
@@ -815,15 +818,14 @@ end
 
 local function drawRadar(cx, cy, r, small)
   radarHits = {}
+  -- Everything except players shrinks as you zoom out and grows as you zoom in.
+  local iconScale = math.max(0.35, math.min(1.6, 64 / zoom))
   circle(cx, cy, r, { 10, 22, 17 }, true)
   for i = 1, 4 do
     circle(cx, cy, r * i / 4, (i == 4) and GRID or GRID2, false)
   end
   line(cx - r, cy, cx + r, cy, GRID2)
   line(cx, cy - r, cx, cy + r, GRID2)
-  for i = 1, 3 do
-    text(math.floor(zoom * i / 4) .. "m", cx + 3, cy - r * i / 4 + 1, GRID, small * 0.85)
-  end
   if detectorPos then
     -- compass letters just inside the rim, turned with the radar
     for _, d in ipairs({ { "N", 0, -1 }, { "E", 1, 0 }, { "S", 0, 1 }, { "W", -1, 0 } }) do
@@ -864,18 +866,18 @@ local function drawRadar(cx, cy, r, small)
       end
       local key = "track:" .. t.id
       if not isShip(c) then table.insert(radarHits, { x = bx, y = by, key = key }) end
-      if key == selected then circle(bx, by, 8, WHITE, false) end
+      if key == selected then circle(bx, by, math.max(5, 8 * iconScale), WHITE, false) end
       if isShip(c) then
         -- drawn in their own pass below so they sit on top
       elseif c == "PROJECTILE" then
-        circle(bx, by, 2, PROJ, true)
+        circle(bx, by, math.max(1, 2 * iconScale), PROJ, true)
       elseif c == "HOSTILE" then
-        rect(bx - 3, by - 3, 6, 6, HOST)
+        local hs = math.max(1, 3 * iconScale)
+        rect(bx - hs, by - hs, hs * 2, hs * 2, HOST)
       elseif c == "PLAYER" then
-        circle(bx, by, 4, UNKNOWN, true)
-        text("?", bx + 7, by - small * 0.5, UNKNOWN, small * 0.9, "bold")
+        circle(bx, by, math.max(2, 4 * iconScale), UNKNOWN, true)
       else
-        circle(bx, by, 2, MOBC, true)
+        circle(bx, by, math.max(1, 2 * iconScale), MOBC, true)
       end
     end
   end
@@ -907,15 +909,15 @@ local function drawRadar(cx, cy, r, small)
       local hd = moving and screenAngle(t.vx, t.vz) or -math.pi / 2
       local ch, sh = math.cos(hd), math.sin(hd)
       local function pt(fx, fy) return bx + fx * ch - fy * sh, by + fx * sh + fy * ch end
-      local scale = 1.3
+      local scale = 1.3 * iconScale
       if moving then
         local k = math.min(r, 5 * t.speed / zoom * (r - 6))
         for i = 1, 6 do
-          local wx, wy = pt(-8 - i * 4, 0)
-          circle(wx, wy, math.max(1, 3 - i * 0.4), mix({ 10, 22, 17 }, SHIPC, 0.6 - i * 0.08), true)
+          local wx, wy = pt((-8 - i * 4) * scale / 1.3, 0)
+          circle(wx, wy, math.max(1, (3 - i * 0.4) * scale / 1.3), mix({ 10, 22, 17 }, SHIPC, 0.6 - i * 0.08), true)
         end
         for i = 0, 7 do
-          local f0, f1 = 12 + k * i / 8, 12 + k * (i + 0.5) / 8
+          local f0, f1 = 12 * scale / 1.3 + k * i / 8, 12 * scale / 1.3 + k * (i + 0.5) / 8
           local x0, y0 = pt(f0, 0)
           local x1, y1 = pt(f1, 0)
           line(x0, y0, x1, y1, SHIPC)
@@ -945,7 +947,7 @@ local function drawRadar(cx, cy, r, small)
       else
         -- Create contraption: a square frame with a cross, like a crate, turned with its heading
         local hs = 7 * scale
-        for i = -hs, hs, 1 do
+        for i = -hs, hs, math.max(0.5, hs / 8) do
           local x0, y0 = pt(-hs, i)
           local x1, y1 = pt(hs, i)
           line(x0, y0, x1, y1, SHIPDARK)
@@ -964,13 +966,7 @@ local function drawRadar(cx, cy, r, small)
       end
       local key = "track:" .. t.id
       table.insert(radarHits, { x = bx, y = by, key = key })
-      if key == selected then circle(bx, by, 16, WHITE, false) end
-      local label = kind .. " " .. (t.number or "?")
-      local sub = meters(t.dist) .. "  " .. shipSpeedText(t)
-      local lw = math.max(textWidth(label, small * 0.9, "bold"), textWidth(sub, small * 0.75))
-      local ly = freeY(bx + 14, by - small, lw, small * 2)
-      text(label, bx + 14, ly, SHIPC, small * 0.9, "bold")
-      text(sub, bx + 14, ly + small, SHIPC, small * 0.75)
+      if key == selected then circle(bx, by, math.max(8, 16 * iconScale), WHITE, false) end
     end
   end
 

@@ -22,6 +22,8 @@ Alerts can also go to a Discord channel through a webhook, no bot or server need
 
 It posts intruders arriving, getting close and leaving, and enemies coming online and going offline. Keep the URL private: anyone who has it can post to that channel.
 
+To ping a role with every alert, set `DISCORD_MENTION = "<@&ROLE_ID>"`. The easiest way to get the ID: type `\@Role Name` in any Discord channel and send it; Discord shows the raw `<@&...>` form to copy.
+
 ## Create Radar
 
 Any Create Radar on the computer or its cable is found automatically (anything with Create Radar's `getTracks` command: radar bearing, plane radar, or radar monitor), including ones added later. With a radar, the **MODE** button cycles:
@@ -30,7 +32,7 @@ Any Create Radar on the computer or its cable is found automatically (anything w
 - **THREATS**: plus hostile mobs, projectiles, ships, and players the detector can't see (shown as amber `?`).
 - **ALL**: everything except dropped items.
 
-Radar players standing where the detector sees someone get that player's name and color. Sable ships show in every mode as numbered cyan hulls (SHIP 1, SHIP 2...) and Create contraptions as purple crates (CONTRAPTION 1, TRAIN 1, GANTRY 1), pointing the way they're heading, with a wake, a dashed line to where they'll be in 5 seconds, distance and measured speed (or "parked"); they also get their own rows under Nearby. New ships are noted in the log (`SHIP_WARN = true` also toasts the allowed list). Tracks are placed using the calibrated detector position (or a plane radar's own position), so calibrate first. Zoom can go out to the radar's range. `RADAR_MODE` sets the starting mode.
+Radar players standing where the detector sees someone get that player's name and color. Sable ships show in every mode as cyan hulls and Create contraptions as purple crates, pointing the way they're heading and shrinking as you zoom out; the radar only labels players, and the Nearby rows and the tap-for-details panel name them (SHIP 1, TRAIN 1, GANTRY 1, CONTRAPTION 1), with a wake, a dashed line to where they'll be in 5 seconds, distance and measured speed (or "parked"); they also get their own rows under Nearby. New ships are noted in the log (`SHIP_WARN = true` also toasts the allowed list). Tracks are placed using the calibrated detector position (or a plane radar's own position), so calibrate first. Zoom can go out to the radar's range. `RADAR_MODE` sets the starting mode.
 
 ## Monitor controls
 
