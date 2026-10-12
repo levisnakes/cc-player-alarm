@@ -10,7 +10,7 @@ ComputerCraft base security for an Advanced Peripherals Player Detector. When a 
 
 Every visit is logged with the time it started, how long it lasted and the closest the player got.
 
-It also toasts the allowed list when a player on `WATCH_JOINS` joins the server (default: `Mechanoo`).
+It also watches the online list for players in `WATCH_JOINS` (default: `Mechanoo`): the allowed list gets a toast when they come online and when they go offline, and an amber bar on the monitor shows while they are on.
 
 ## Create Radar
 

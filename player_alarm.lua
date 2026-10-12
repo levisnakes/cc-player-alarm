@@ -12,7 +12,7 @@ CLOSE_WARNING = 16        -- warn again if an intruder gets this close
 
 ALARM_SIDE = "bottom"     -- redstone on while an intruder is near; nil = off
 CHAT_WARN = true          -- toast online allowed players through a Chat Box
-WATCH_JOINS = { "Mechanoo" }  -- toast the allowed list when these players join the server
+WATCH_JOINS = { "Mechanoo" }  -- warn while these players are online (toast on join and leave)
 MUTE_MINUTES = 5          -- how long the MUTE button silences the siren and speaker
 UNLOCK_SECONDS = 60       -- right-click the detector to unlock MUTE on the monitor
 UTC_OFFSET = 0            -- hours added to server time for the log (e.g. -5)
@@ -447,14 +447,48 @@ end
 local watched = {}
 for _, n in ipairs(WATCH_JOINS) do watched[n:lower()] = true end
 
+-- Watched players currently online, by lower-case name -> display name.
+local watchedOnline = {}
+
+local function checkWatched()
+  local ok, online = dcall("getOnlinePlayers")
+  if not ok or type(online) ~= "table" then return end
+  local now_ = {}
+  for _, p in ipairs(online) do
+    if watched[p:lower()] then now_[p:lower()] = p end
+  end
+  for key, name in pairs(now_) do
+    if not watchedOnline[key] then
+      event(name .. " is online", "alert")
+      warnAllowed(name .. " is online", "Watched player online", name)
+    end
+  end
+  for key, name in pairs(watchedOnline) do
+    if not now_[key] then
+      event(name .. " went offline", "info")
+      warnAllowed(name .. " went offline", "Watched player offline", name)
+    end
+  end
+  watchedOnline = now_
+end
+
+local function watchLoop()
+  while true do
+    pcall(checkWatched)
+    local timer = os.startTimer(5)
+    repeat
+      local ev, id = os.pullEvent()
+    until ev == "watch_check" or (ev == "timer" and id == timer)
+  end
+end
+
 local function eventLoop()
   while true do
     local ev, a = os.pullEvent()
     if ev == "peripheral" or ev == "peripheral_detach" then
       findPeripherals()
-    elseif ev == "player_join" and type(a) == "string" and watched[a:lower()] then
-      event(a .. " joined the server", "info")
-      warnAllowed(a .. " joined the server", "Player joined", a)
+    elseif (ev == "player_join" or ev == "player_leave") and type(a) == "string" and watched[a:lower()] then
+      os.queueEvent("watch_check")
     elseif ev == "player_click" and type(a) == "string" then
       if isAllowed(a) then
         unlockUntil, unlockedBy = now() + UNLOCK_SECONDS, a
@@ -822,6 +856,17 @@ local function drawGpu()
   end
   y = y + bannerH + pad
 
+  local watchNames = {}
+  for _, name in pairs(watchedOnline) do table.insert(watchNames, name) end
+  if #watchNames > 0 then
+    table.sort(watchNames)
+    local stripH = small + pad
+    rect(pad, y, W - pad * 2, stripH, AMBER)
+    local msg = table.concat(watchNames, ", ") .. (#watchNames == 1 and " is online" or " are online")
+    text(fit("! " .. msg, W - pad * 4, small, "bold"), pad * 2, y + (stripH - small) / 2 - 1, BG, small, "bold")
+    y = y + stripH + pad / 2
+  end
+
   -- Toolbar: zoom, log, mute
   local tbH = small + pad
   local bw = math.floor((W - pad * 2 - pad * 4) / 5)
@@ -965,6 +1010,9 @@ local function drawPlain()
   local intruders = intruderCount()
   local banner = scanError or ((intruders > 0) and (intruders .. " INTRUDER" .. (intruders > 1 and "S" or "")) or "SECURE")
   local bg = scanError and colours.orange or ((intruders > 0) and colours.red or colours.green)
+  local wn = {}
+  for _, name in pairs(watchedOnline) do table.insert(wn, name) end
+  if #wn > 0 then at(1, 2, ("! " .. table.concat(wn, ", ") .. " online"):sub(1, w), colours.black, colours.orange) end
   at(1, 3, string.rep(" ", w), colours.white, bg)
   at(math.max(1, math.floor((w - #banner) / 2) + 1), 3, banner:sub(1, w), colours.white, bg)
   local y = 5
@@ -1037,6 +1085,12 @@ local function drawTerminal(useGpu)
   put(2, 3, "Detector: " .. (detector and "ok" or "missing") .. "   Chat box: " .. (chat and "ok" or "none") .. "   Speaker: " .. (speaker and "ok" or "none"), colors.lightGray)
   put(2, 4, "Monitor: " .. (useGpu and "DirectGPU" or "plain") .. "   Direction: " .. (detectorPos and "calibrated" or "not calibrated"), colors.lightGray)
   if muted() then put(2, 5, "Alarm muted for " .. fmtDuration(muteUntil - now()), colors.orange) end
+  local onlineNames = {}
+  for _, name in pairs(watchedOnline) do table.insert(onlineNames, name) end
+  if #onlineNames > 0 then
+    put(1, 2, string.rep(" ", TW), colors.black, colors.orange)
+    put(2, 2, (table.concat(onlineNames, ", ") .. " online"):sub(1, TW - 2), colors.black, colors.orange)
+  end
   if #radars > 0 then
     local ships, hostile, unknown, other = radarSummary()
     put(2, 5, "Radar x" .. #radars .. " " .. currentMode() .. ": " .. ships .. " ship " .. hostile .. " hostile " .. unknown .. " unknown", colors.lightBlue)
@@ -1326,4 +1380,4 @@ local function updateLoop()
   end
 end
 
-parallel.waitForAny(scanLoop, chatLoop, eventLoop, displayLoop, terminalLoop, touchLoop, updateLoop)
+parallel.waitForAny(scanLoop, chatLoop, eventLoop, watchLoop, displayLoop, terminalLoop, touchLoop, updateLoop)
