@@ -10,7 +10,7 @@ ComputerCraft base security for an Advanced Peripherals Player Detector. When a 
 
 Every visit is logged with the time it started, how long it lasted and the closest the player got.
 
-It also watches the online list for players in `WATCH_JOINS` (default: `Mechanoo`): the allowed list gets a toast when they come online and when they go offline, and an amber bar on the monitor shows while they are on.
+Players in `WATCH_JOINS` (default: `Mechanoo`) are treated as enemies: when one comes online, every other online player gets a formatted **ENEMY DETECTED** chat message (the enemy doesn't), with a random line from `ENEMY_LINES`, and an amber ENEMY ONLINE bar shows on the monitor while they're on.
 
 ## Create Radar
 

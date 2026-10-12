@@ -12,7 +12,14 @@ CLOSE_WARNING = 16        -- warn again if an intruder gets this close
 
 ALARM_SIDE = "bottom"     -- redstone on while an intruder is near; nil = off
 CHAT_WARN = true          -- toast online allowed players through a Chat Box
-WATCH_JOINS = { "Mechanoo" }  -- warn while these players are online (toast on join and leave)
+WATCH_JOINS = { "Mechanoo" }  -- enemies: announced in chat to everyone else when they come online
+ENEMY_LINES = {                   -- one of these is picked at random for each announcement
+  "Lock the vaults. Man the cannons. Trust no one.",
+  "Hide your shells and guard your ships.",
+  "All hands to battle stations!",
+  "Watch your back. The enemy is among us.",
+  "Raise the shields and double the guards.",
+}
 MUTE_MINUTES = 5          -- how long the MUTE button silences the siren and speaker
 UNLOCK_SECONDS = 60       -- right-click the detector to unlock MUTE on the monitor
 UTC_OFFSET = 0            -- hours added to server time for the log (e.g. -5)
@@ -432,7 +439,12 @@ end
 local function chatLoop()
   while true do
     local msg = table.remove(chatQueue, 1)
-    if msg and chat then
+    if msg and chat and msg.json then
+      local opts = { player = msg.player, prefix = "BASE DEFENSE", brackets = "[]", bracketsColor = "&4" }
+      local ok = pcall(chat.sendFormattedMessage, msg.json, opts)
+      if not ok then pcall(chat.sendMessage, msg.text, { player = msg.player, prefix = "DEFENSE" }) end
+      sleep(1.1)
+    elseif msg and chat then
       local okT = pcall(chat.sendToast, { message = msg.text, title = msg.title, player = msg.player, prefix = "Security" })
       if not okT then
         pcall(chat.sendMessage, msg.text, { player = msg.player, prefix = "Security" })
@@ -450,6 +462,39 @@ for _, n in ipairs(WATCH_JOINS) do watched[n:lower()] = true end
 -- Watched players currently online, by lower-case name -> display name.
 local watchedOnline = {}
 
+-- Minecraft chat JSON for the enemy announcement.
+local function enemyMessage(name)
+  local line = ENEMY_LINES[math.random(1, #ENEMY_LINES)]
+  local SWORDS = "\226\154\148"  -- U+2694 crossed swords, as UTF-8 bytes
+  local parts = {
+    { text = SWORDS .. " ENEMY DETECTED " .. SWORDS .. "\n", color = "dark_red", bold = true },
+    { text = name, color = "red", bold = true, underlined = true },
+    { text = " has entered the server.\n", color = "gray" },
+    { text = line, color = "gold", italic = true },
+  }
+  -- unicode_strings turns the UTF-8 symbols into \u escapes Minecraft understands;
+  -- older CC versions don't have it, so fall back to plain ASCII.
+  local ok, json = pcall(textutils.serializeJSON, parts, { unicode_strings = true })
+  if not ok then
+    parts[1].text = "!! ENEMY DETECTED !!\n"
+    json = textutils.serializeJSON(parts)
+  end
+  return json, "ENEMY DETECTED: " .. name .. " has entered the server. " .. line
+end
+
+-- Everyone online except the enemy hears about it, enemy alerts first in line.
+local function announceEnemy(name, online)
+  if not chat then return end
+  local json, plain = enemyMessage(name)
+  local pos = 1
+  for _, p in ipairs(online) do
+    if p:lower() ~= name:lower() then
+      table.insert(chatQueue, pos, { player = p, json = json, text = plain })
+      pos = pos + 1
+    end
+  end
+end
+
 local function checkWatched()
   local ok, online = dcall("getOnlinePlayers")
   if not ok or type(online) ~= "table" then return end
@@ -459,14 +504,13 @@ local function checkWatched()
   end
   for key, name in pairs(now_) do
     if not watchedOnline[key] then
-      event(name .. " is online", "alert")
-      warnAllowed(name .. " is online", "Watched player online", name)
+      event("ENEMY " .. name .. " is online", "alert")
+      announceEnemy(name, online)
     end
   end
   for key, name in pairs(watchedOnline) do
     if not now_[key] then
       event(name .. " went offline", "info")
-      warnAllowed(name .. " went offline", "Watched player offline", name)
     end
   end
   watchedOnline = now_
@@ -862,8 +906,8 @@ local function drawGpu()
     table.sort(watchNames)
     local stripH = small + pad
     rect(pad, y, W - pad * 2, stripH, AMBER)
-    local msg = table.concat(watchNames, ", ") .. (#watchNames == 1 and " is online" or " are online")
-    text(fit("! " .. msg, W - pad * 4, small, "bold"), pad * 2, y + (stripH - small) / 2 - 1, BG, small, "bold")
+    local msg = "ENEMY ONLINE: " .. table.concat(watchNames, ", ")
+    text(fit(msg, W - pad * 4, small, "bold"), pad * 2, y + (stripH - small) / 2 - 1, BG, small, "bold")
     y = y + stripH + pad / 2
   end
 
