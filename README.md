@@ -30,7 +30,7 @@ Any Create Radar on the computer or its cable is found automatically (anything w
 - **THREATS**: plus hostile mobs, projectiles, ships, and players the detector can't see (shown as amber `?`).
 - **ALL**: everything except dropped items.
 
-Radar players standing where the detector sees someone get that player's name and color. Ships show as blue diamonds with a velocity arrow, and new ships are noted in the log (`SHIP_WARN = true` also toasts the allowed list). Tracks are placed using the calibrated detector position (or a plane radar's own position), so calibrate first. Zoom can go out to the radar's range. `RADAR_MODE` sets the starting mode.
+Radar players standing where the detector sees someone get that player's name and color. Ships show in every mode as numbered cyan hulls (SHIP 1, SHIP 2...) pointing the way they're heading, with a wake, a dashed line to where they'll be in 5 seconds, distance and measured speed (or "parked"); they also get their own rows under Nearby. New ships are noted in the log (`SHIP_WARN = true` also toasts the allowed list). Tracks are placed using the calibrated detector position (or a plane radar's own position), so calibrate first. Zoom can go out to the radar's range. `RADAR_MODE` sets the starting mode.
 
 ## Monitor controls
 

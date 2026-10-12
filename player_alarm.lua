@@ -300,6 +300,8 @@ end
 
 local tracks = {}       -- radar tracks, positioned relative to the base
 local seenShips = {}
+local shipHistory = {}  -- [id] = { x, z, t, vx, vz } for measuring speed and heading
+local shipNumbers, nextShipNumber = {}, 1
 local MODES = { "players", "threats", "all" }
 local mode = readFile(DIR .. "/mode", nil)
 
@@ -377,6 +379,34 @@ local function scanRadars()
   for id, at in pairs(seenShips) do
     if t - at > 60 then seenShips[id] = nil end
   end
+
+  -- Speed and heading from how far each ship moved since the last scan
+  -- (blocks per second), smoothed so it doesn't jitter.
+  for _, e in ipairs(out) do
+    if isShip(e.category) and e.dx then
+      if not shipNumbers[e.id] then
+        shipNumbers[e.id] = nextShipNumber
+        nextShipNumber = nextShipNumber + 1
+      end
+      e.number = shipNumbers[e.id]
+      local h = shipHistory[e.id]
+      if h and t - h.t >= 0.5 then
+        local dt = t - h.t
+        local vx, vz = (e.dx - h.x) / dt, (e.dz - h.z) / dt
+        h.vx = h.vx and (h.vx * 0.5 + vx * 0.5) or vx
+        h.vz = h.vz and (h.vz * 0.5 + vz * 0.5) or vz
+        h.x, h.z, h.t = e.dx, e.dz, t
+      elseif not h then
+        h = { x = e.dx, z = e.dz, t = t }
+        shipHistory[e.id] = h
+      end
+      e.vx, e.vz = h.vx or 0, h.vz or 0
+      e.speed = math.sqrt(e.vx * e.vx + e.vz * e.vz)
+    end
+  end
+  for id, h in pairs(shipHistory) do
+    if t - h.t > 60 then shipHistory[id] = nil end
+  end
   tracks = out
 end
 
@@ -384,11 +414,14 @@ end
 local function visibleTracks()
   local m = currentMode()
   local out = {}
-  if m == "players" then return out end
   for _, e in ipairs(tracks) do
     local c = e.category
     local show
-    if c == "PLAYER" then
+    if isShip(c) then
+      show = true  -- ships are always worth seeing
+    elseif m == "players" then
+      show = false
+    elseif c == "PLAYER" then
       show = e.name == nil
     elseif m == "threats" then
       show = c == "HOSTILE" or c == "PROJECTILE" or isShip(c)
@@ -398,6 +431,20 @@ local function visibleTracks()
     if show then table.insert(out, e) end
   end
   return out
+end
+
+local function shipList()
+  local list = {}
+  for _, e in ipairs(tracks) do
+    if isShip(e.category) and e.dist then table.insert(list, e) end
+  end
+  table.sort(list, function(a, b) return a.dist < b.dist end)
+  return list
+end
+
+local function shipSpeedText(e)
+  if not e.speed or e.speed < 0.3 then return "parked" end
+  return math.floor(e.speed + 0.5) .. " m/s"
 end
 
 local function radarSummary()
@@ -778,18 +825,15 @@ local function drawRadar(cx, cy, r, small)
       local d = math.min(1, t.dist / zoom) * (r - 6)
       local bx, by = cx + math.cos(a) * d, cy + math.sin(a) * d
       local c = t.category
-      if isShip(c) or c == "PROJECTILE" then
-        -- velocity arrow, length = where it'll be in 5 seconds
+      if c == "PROJECTILE" then
         local v = t.vel
         if type(v) == "table" and v.x then
           local k = 100 / zoom * (r - 6)
-          local ex, ey = bx + v.x * k, by + v.z * k
-          line(bx, by, ex, ey, isShip(c) and SHIP or PROJ)
+          line(bx, by, bx + v.x * k, by + v.z * k, PROJ)
         end
       end
       if isShip(c) then
-        for i = 0, 4 do line(bx - 5 + i, by - i, bx + 5 - i, by - i, SHIP) line(bx - 5 + i, by + i, bx + 5 - i, by + i, SHIP) end
-        text("ship", bx + 8, by - small * 0.5, SHIP, small * 0.8)
+        -- drawn in their own pass below so they sit on top
       elseif c == "PROJECTILE" then
         circle(bx, by, 2, PROJ, true)
       elseif c == "HOSTILE" then
@@ -800,6 +844,59 @@ local function drawRadar(cx, cy, r, small)
       else
         circle(bx, by, 2, MOBC, true)
       end
+    end
+  end
+
+  -- Ships: a filled hull pointing where it's heading, a fading wake behind,
+  -- a dashed line to where it'll be in 5 seconds, and a label.
+  local SHIPC = { 70, 215, 255 }
+  local SHIPDARK = { 20, 70, 95 }
+  for _, t in ipairs(visibleTracks()) do
+    if isShip(t.category) and t.dist and t.dx then
+      local a = math.atan2(t.dz, t.dx)
+      local d = math.min(1, t.dist / zoom) * (r - 6)
+      local bx, by = cx + math.cos(a) * d, cy + math.sin(a) * d
+      local moving = t.speed and t.speed >= 0.3
+      local hd = moving and math.atan2(t.vz, t.vx) or -math.pi / 2
+      local ch, sh = math.cos(hd), math.sin(hd)
+      local function pt(fx, fy) return bx + fx * ch - fy * sh, by + fx * sh + fy * ch end
+      local scale = 1.3
+      if moving then
+        local k = math.min(r, 5 * t.speed / zoom * (r - 6))
+        for i = 1, 6 do
+          local wx, wy = pt(-8 - i * 4, 0)
+          circle(wx, wy, math.max(1, 3 - i * 0.4), mix({ 10, 22, 17 }, SHIPC, 0.6 - i * 0.08), true)
+        end
+        for i = 0, 7 do
+          local f0, f1 = 12 + k * i / 8, 12 + k * (i + 0.5) / 8
+          local x0, y0 = pt(f0, 0)
+          local x1, y1 = pt(f1, 0)
+          line(x0, y0, x1, y1, SHIPC)
+        end
+      end
+      -- hull: nose, then the stern corners, filled with a fan of lines
+      local nx, ny = pt(11 * scale, 0)
+      local stern = { { -7, -6 }, { -9, -3 }, { -9, 3 }, { -7, 6 } }
+      for i = 1, #stern - 1 do
+        local ax, ay = stern[i][1] * scale, stern[i][2] * scale
+        local bx2, by2 = stern[i + 1][1] * scale, stern[i + 1][2] * scale
+        for s2 = 0, 8 do
+          local fx = ax + (bx2 - ax) * s2 / 8
+          local fy = ay + (by2 - ay) * s2 / 8
+          local px, py = pt(fx, fy)
+          line(nx, ny, px, py, SHIPDARK)
+        end
+      end
+      local prevx, prevy = nx, ny
+      for _, sp in ipairs(stern) do
+        local px, py = pt(sp[1] * scale, sp[2] * scale)
+        line(prevx, prevy, px, py, SHIPC)
+        prevx, prevy = px, py
+      end
+      line(prevx, prevy, nx, ny, SHIPC)
+      local label = "SHIP " .. (t.number or "?")
+      text(label, bx + 14, by - small, SHIPC, small * 0.9, "bold")
+      text(meters(t.dist) .. "  " .. shipSpeedText(t), bx + 14, by, SHIPC, small * 0.75)
     end
   end
 
@@ -1070,9 +1167,11 @@ local function drawGpu()
   textRight(fit(hdr, W * 0.7, small), W - pad * 1.6, y + pad / 2, MUTED, small)
   y = y + small + pad + 2
   local list = nearbyList()
+  local ships = shipList()
   local rowH = medium + 8
-  local maxNearby = math.max(1, math.min(4, #list))
-  if #list > 4 then maxNearby = 3 end
+  local slots = (#ships > 0) and 3 or 4
+  local maxNearby = math.max(1, math.min(slots, #list))
+  if #list > slots then maxNearby = slots - 1 end
   if #list == 0 then
     text("Nobody in range", pad * 1.6, y + 4, MUTED, medium)
     y = y + rowH
@@ -1095,6 +1194,18 @@ local function drawGpu()
   end
   if #list > maxNearby then
     text("+" .. (#list - maxNearby) .. " more nearby", pad * 1.6, y + 2, MUTED, small)
+    y = y + small + 6
+  end
+  local SHIPC = { 70, 215, 255 }
+  for i = 1, math.min(2, #ships) do
+    local e = ships[i]
+    rect(pad, y, 4, rowH - 4, SHIPC)
+    text("SHIP " .. (e.number or "?"), pad * 1.6, y + 2, SHIPC, medium, "bold")
+    textRight(meters(e.dist) .. " " .. compass(e.dx, e.dz) .. "  " .. shipSpeedText(e), W - pad * 1.6, y + 2, SHIPC, medium, "bold")
+    y = y + rowH
+  end
+  if #ships > 2 then
+    text("+" .. (#ships - 2) .. " more ships", pad * 1.6, y + 2, MUTED, small)
     y = y + small + 6
   end
   y = y + pad / 2
