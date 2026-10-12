@@ -24,6 +24,7 @@ MUTE_MINUTES = 5          -- how long the MUTE button silences the siren and spe
 UNLOCK_SECONDS = 60       -- right-click the detector to unlock MUTE on the monitor
 UTC_OFFSET = 0            -- hours added to server time for the log (e.g. -5)
 
+DISCORD_WEBHOOK = nil     -- paste a Discord webhook URL here (in quotes) to post alerts to a channel
 RADAR_MODE = "auto"       -- radar view: "players", "threats" or "all"; "auto" = threats when a Create Radar is found
 SHIP_WARN = false         -- toast the allowed list when a new ship shows up on the radar
 
@@ -105,17 +106,21 @@ local detector, chat, speaker
 local radars = {}
 local radarRange = 0
 
+local radarHasPosition = {}
+
+-- A radar is anything with Create Radar's getTracks command: radar bearings
+-- ("create_radar:radar_bearing"), plane radars and radar monitors.
 local function findRadars()
   radars = {}
   radarRange = 0
+  radarHasPosition = {}
   for _, name in ipairs(peripheral.getNames()) do
-    local isRadar = peripheral.hasType(name, "radar") or peripheral.hasType(name, "plane_radar")
-    if not isRadar and peripheral.hasType(name, "monitor") then
-      local ok, methods = pcall(peripheral.getMethods, name)
-      if ok and type(methods) == "table" then
-        for _, m in ipairs(methods) do
-          if m == "getSelectedTrackId" then isRadar = true break end
-        end
+    local isRadar = false
+    local ok, methods = pcall(peripheral.getMethods, name)
+    if ok and type(methods) == "table" then
+      for _, m in ipairs(methods) do
+        if m == "getTracks" then isRadar = true end
+        if m == "getPosition" then radarHasPosition[name] = true end
       end
     end
     if isRadar then
@@ -199,6 +204,44 @@ local function warnAllowed(text, title, skip)
   end
 end
 
+-- Discord: posts to a channel webhook. No bot or server needed.
+local discordQueue = {}
+local discordError = nil
+
+local function discord(title, text, color)
+  if not DISCORD_WEBHOOK or DISCORD_WEBHOOK == "" or not http then return end
+  table.insert(discordQueue, { title = title, text = text, color = color })
+end
+
+local function discordLoop()
+  while true do
+    local msg = table.remove(discordQueue, 1)
+    if msg then
+      local body = textutils.serializeJSON({
+        username = TITLE,
+        embeds = { {
+          title = msg.title,
+          description = msg.text,
+          color = msg.color or 15158332,
+          footer = { text = os.date("!%Y-%m-%d %H:%M UTC") },
+        } },
+      })
+      local ok, res, err = pcall(http.post, DISCORD_WEBHOOK, body, { ["Content-Type"] = "application/json" })
+      if ok and res then
+        res.close()
+        discordError = nil
+      else
+        discordError = tostring(err or res)
+      end
+      sleep(2)  -- stay well under Discord's webhook rate limit
+    else
+      sleep(0.5)
+    end
+  end
+end
+
+local RED_C, GREEN_C, AMBER_C, PURPLE_C = 15158332, 3066993, 15844367, 10181046
+
 local function ring()
   if not speaker or muted() then return end
   for i = 1, 3 do
@@ -222,6 +265,7 @@ end
 
 local function onArrive(v)
   local where = whereText(v.name, v.dist)
+  discord("Intruder detected", "**" .. v.name .. "** is " .. where .. " from base.", RED_C)
   event(v.name .. " arrived (" .. where .. ")", "alert")
   warnAllowed("Intruder " .. v.name .. " is " .. where .. " from base", "Intruder alert")
   alertFlash = now() + 6
@@ -230,6 +274,7 @@ end
 
 local function onClose(v)
   local where = whereText(v.name, v.dist)
+  discord("Intruder getting close", "**" .. v.name .. "** is " .. where .. " from base.", RED_C)
   event(v.name .. " is " .. where .. " away", "alert")
   warnAllowed(v.name .. " is getting close: " .. where, "Intruder close")
   alertFlash = now() + 6
@@ -239,6 +284,7 @@ local function onLeave(v)
   local dur = v.last - v.first
   local closest = meters(v.closest)
   event(v.name .. " left after " .. fmtDuration(dur) .. ", closest " .. closest, "info")
+  discord("Intruder left", "**" .. v.name .. "** left after " .. fmtDuration(dur) .. ". Closest: " .. closest .. ".", GREEN_C)
   warnAllowed(v.name .. " left after " .. fmtDuration(dur) .. " (closest " .. closest .. ")", "Intruder left")
   table.insert(visits, { name = v.name, first = v.first, last = v.last, closest = v.closest })
   while #visits > 500 do table.remove(visits, 1) end
@@ -269,7 +315,7 @@ end
 local function baseCenter()
   if detectorPos then return detectorPos end
   for _, name in ipairs(radars) do
-    if peripheral.hasType(name, "plane_radar") then
+    if radarHasPosition[name] then
       local ok, pos = pcall(peripheral.call, name, "getPosition")
       if ok and type(pos) == "table" and pos.x then return pos end
     end
@@ -533,11 +579,13 @@ local function checkWatched()
     if not watchedOnline[key] then
       event("ENEMY " .. name .. " is online", "alert")
       announceEnemy(name, online)
+      discord("ENEMY DETECTED", "**" .. name .. "** has entered the server.", PURPLE_C)
     end
   end
   for key, name in pairs(watchedOnline) do
     if not now_[key] then
       event(name .. " went offline", "info")
+      discord("Enemy offline", "**" .. name .. "** left the server.", AMBER_C)
     end
   end
   watchedOnline = now_
@@ -601,6 +649,7 @@ end
 -- ============================================================ DirectGPU screen
 
 local gpu, display, W, H
+local gpuError = nil
 local view = "radar"     -- "radar" or "log"
 local viewAt = 0
 local zoom = RANGE        -- radar scale in blocks (view only)
@@ -667,9 +716,13 @@ end
 local function setupGpu()
   gpu = peripheral.find("directgpu")
   local mon = findMonitor()
-  if not gpu or not mon then return false end
+  if not gpu then gpuError = "no DirectGPU block found" return false end
+  if not mon then gpuError = "no monitor found" return false end
   local ok, id = pcall(gpu.autoDetectAndCreateDisplay, mon, 1)
-  if not ok then return false end
+  if not ok then
+    gpuError = "couldn't use monitor " .. mon .. ": " .. tostring(id):gsub("^.-:%d+: ", "")
+    return false
+  end
   display = id
   local info = gpu.getDisplayInfo(display)
   if info.pixelWidth < 400 then
@@ -1189,6 +1242,8 @@ local function drawStatusTab(y)
   dot(2, y, useGpu, "Monitor", useGpu and "DirectGPU" or "plain")
   dot(27, y, speaker ~= nil, "Speaker", speaker and "ok" or "none")
   y = y + 1
+  dot(2, y, DISCORD_WEBHOOK ~= nil and discordError == nil, "Discord", DISCORD_WEBHOOK and (discordError and "error" or "on") or "off")
+  y = y + 1
   dot(2, y, detectorPos ~= nil, "Direction", detectorPos and "calibrated" or "not calibrated")
   if #radars > 0 then
     local ships, hostile, unknown = radarSummary()
@@ -1201,6 +1256,19 @@ local function drawStatusTab(y)
   y = y + 1
   if scanError then
     put(2, y, scanError:sub(1, TW - 2), colors.red)
+    y = y + 1
+  end
+  if gpuError then
+    local msg = "GPU: " .. gpuError
+    put(2, y, msg:sub(1, TW - 2), colors.orange)
+    y = y + 1
+    if #msg > TW - 2 then
+      put(2, y, msg:sub(TW - 1, 2 * (TW - 2)), colors.orange)
+      y = y + 1
+    end
+  end
+  if DISCORD_WEBHOOK and discordError then
+    put(2, y, ("Discord: " .. discordError):sub(1, TW - 2), colors.orange)
     y = y + 1
   end
 
@@ -1298,6 +1366,13 @@ local function drawToolsTab(y)
   end)
   put(20, y, "toast, allowed list only", colors.gray)
   y = y + 2
+  button(2, y, "Test Discord", colors.purple, function()
+    if not DISCORD_WEBHOOK then say("Set DISCORD_WEBHOOK at the top of the file first") return end
+    discord("Test", "Base security is connected to this channel.", GREEN_C)
+    say("Test sent to Discord")
+  end)
+  put(20, y, "post a test to the webhook", colors.gray)
+  y = y + 2
   local armed = now() - confirmClear < 5
   button(2, y, armed and "Really clear?" or "Clear log", colors.red, function()
     if now() - confirmClear < 5 then
@@ -1359,19 +1434,32 @@ end
 local useGpu = false
 
 local function displayLoop()
-  useGpu = setupGpu()
-  local retryAt = now() + 30
+  local ok, err = pcall(setupGpu)
+  useGpu = ok and err == true
+  if not useGpu then gpuError = ok and (gpuError or "no DirectGPU block or monitor found") or tostring(err) end
+  local retryAt = now() + 10
+  local failures = 0
   while true do
     if view == "log" and now() - viewAt > 30 then view = "radar" end
     if useGpu then
-      local ok = pcall(drawGpu)
-      if not ok then useGpu = false retryAt = now() + 30 end
+      local okD, errD = pcall(drawGpu)
+      if okD then
+        failures = 0
+        gpuError = nil
+      else
+        failures = failures + 1
+        gpuError = tostring(errD)
+        -- one bad frame isn't a reason to give up on the color screen
+        if failures >= 3 then useGpu = false retryAt = now() + 10 end
+      end
     end
     if not useGpu then
       pcall(drawPlain)
       if now() >= retryAt then
-        useGpu = setupGpu()
-        retryAt = now() + 30
+        local okS, res = pcall(setupGpu)
+        useGpu = okS and res == true
+        if not useGpu then gpuError = okS and (gpuError or "no DirectGPU block or monitor found") or tostring(res) end
+        retryAt = now() + 10
       end
     end
     sleep(0.3)
@@ -1576,4 +1664,4 @@ local function updateLoop()
   end
 end
 
-parallel.waitForAny(scanLoop, chatLoop, eventLoop, watchLoop, displayLoop, terminalLoop, touchLoop, updateLoop)
+parallel.waitForAny(scanLoop, chatLoop, discordLoop, eventLoop, watchLoop, displayLoop, terminalLoop, touchLoop, updateLoop)

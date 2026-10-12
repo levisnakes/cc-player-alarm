@@ -12,9 +12,19 @@ Every visit is logged with the time it started, how long it lasted and the close
 
 Players in `WATCH_JOINS` (default: `Mechanoo`) are treated as enemies: when one comes online, every other online player gets a formatted **ENEMY DETECTED** chat message (the enemy doesn't), with a random line from `ENEMY_LINES`, and an amber ENEMY ONLINE bar shows on the monitor while they're on.
 
+## Discord
+
+Alerts can also go to a Discord channel through a webhook, no bot or server needed:
+
+1. In Discord: channel settings, **Integrations**, **Webhooks**, **New Webhook**, **Copy Webhook URL**.
+2. Paste it at the top of the file: `DISCORD_WEBHOOK = "https://discord.com/api/webhooks/..."`
+3. On the computer, **Tools**, **Test Discord**.
+
+It posts intruders arriving, getting close and leaving, and enemies coming online and going offline. Keep the URL private: anyone who has it can post to that channel.
+
 ## Create Radar
 
-Any Create Radar on the computer or its cable is found automatically (radar bearing, plane radar, or radar monitor), including ones added later. With a radar, the **MODE** button cycles:
+Any Create Radar on the computer or its cable is found automatically (anything with Create Radar's `getTracks` command: radar bearing, plane radar, or radar monitor), including ones added later. With a radar, the **MODE** button cycles:
 
 - **PLAYERS**: just the Player Detector.
 - **THREATS**: plus hostile mobs, projectiles, ships, and players the detector can't see (shown as amber `?`).
