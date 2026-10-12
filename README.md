@@ -45,4 +45,8 @@ wget https://raw.githubusercontent.com/levisnakes/cc-player-alarm/main/player_al
 3. Edit the top of the file: `ALLOWED` names, `RANGE`, `ALARM_SIDE`, `UTC_OFFSET` for local times in the log.
 4. Stand on top of the Player Detector by yourself and press **Calibrate** on the computer. This gives the radar real directions. Before you do, distances are still exact but blips are placed at a fixed angle per player.
 
-The computer screen lists nearby players with an **Allow** button, lets you add or remove allowed names, and clear the log. Everything on the monitor except MUTE only changes the view, and MUTE needs the detector unlock.
+The computer screen has three tabs:
+
+- **Status**: what's connected, whether the detector is calibrated, radar status, and nearby players with an **Allow** button.
+- **People**: the allowed list (names from `ALLOWED` in the file are always allowed and marked `file`; ones added on the computer can be removed) and the enemy list with who's online.
+- **Tools**: Calibrate, Mute, **Test enemy msg** (sends the enemy chat message to the allowed list only, marked as a test), **Test alert** (a toast to the allowed list), and Clear log (asks to confirm). Everything on the monitor except MUTE only changes the view, and MUTE needs the detector unlock.

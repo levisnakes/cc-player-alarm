@@ -71,6 +71,8 @@ local function clockText()
 end
 
 local DIRS = { "N", "NE", "E", "SE", "S", "SW", "W", "NW" }
+local function meters(d) return d and (math.floor(d + 0.5) .. "m") or "?" end
+
 local function compass(dx, dz)
   local a = math.deg(math.atan2(dx, -dz)) % 360
   return DIRS[math.floor((a + 22.5) / 45) % 8 + 1]
@@ -80,11 +82,9 @@ end
 
 if not fs.exists(DIR) then fs.makeDir(DIR) end
 
-local allowed = readFile(DIR .. "/allowed", nil)
-if not allowed then
-  allowed = {}
-  for _, n in ipairs(ALLOWED) do allowed[n:lower()] = n end
-end
+-- Saved list (changed from the computer) plus everything in ALLOWED above.
+local allowed = readFile(DIR .. "/allowed", nil) or {}
+for _, n in ipairs(ALLOWED) do allowed[n:lower()] = n end
 local function saveAllowed() writeFile(DIR .. "/allowed", allowed) end
 local function isAllowed(name) return allowed[name:lower()] ~= nil end
 
@@ -213,8 +213,15 @@ local function event(text, kind)
   while #log > 8 do table.remove(log) end
 end
 
+local function whereText(name, dist)
+  local e = present[name]
+  if not dist then return "in range" end
+  if e and e.dx then return meters(dist) .. " " .. compass(e.dx, e.dz) end
+  return meters(dist)
+end
+
 local function onArrive(v)
-  local where = v.dist and (math.floor(v.dist) .. "m") or "in range"
+  local where = whereText(v.name, v.dist)
   event(v.name .. " arrived (" .. where .. ")", "alert")
   warnAllowed("Intruder " .. v.name .. " is " .. where .. " from base", "Intruder alert")
   alertFlash = now() + 6
@@ -222,14 +229,15 @@ local function onArrive(v)
 end
 
 local function onClose(v)
-  event(v.name .. " is " .. math.floor(v.dist) .. "m away", "alert")
-  warnAllowed(v.name .. " is getting close: " .. math.floor(v.dist) .. "m", "Intruder close")
+  local where = whereText(v.name, v.dist)
+  event(v.name .. " is " .. where .. " away", "alert")
+  warnAllowed(v.name .. " is getting close: " .. where, "Intruder close")
   alertFlash = now() + 6
 end
 
 local function onLeave(v)
   local dur = v.last - v.first
-  local closest = v.closest and (math.floor(v.closest) .. "m") or "?"
+  local closest = meters(v.closest)
   event(v.name .. " left after " .. fmtDuration(dur) .. ", closest " .. closest, "info")
   warnAllowed(v.name .. " left after " .. fmtDuration(dur) .. " (closest " .. closest .. ")", "Intruder left")
   table.insert(visits, { name = v.name, first = v.first, last = v.last, closest = v.closest })
@@ -313,7 +321,7 @@ local function scanRadars()
   for _, e in ipairs(out) do
     if isShip(e.category) then
       if not seenShips[e.id] then
-        local where = e.dist and (math.floor(e.dist) .. "m " .. compass(e.dx, e.dz)) or "in range"
+        local where = e.dist and (meters(e.dist) .. " " .. compass(e.dx, e.dz)) or "in range"
         event("Ship on radar, " .. where, "info")
         if SHIP_WARN then warnAllowed("Ship detected " .. where, "Radar") end
       end
@@ -463,7 +471,7 @@ for _, n in ipairs(WATCH_JOINS) do watched[n:lower()] = true end
 local watchedOnline = {}
 
 -- Minecraft chat JSON for the enemy announcement.
-local function enemyMessage(name)
+local function enemyMessage(name, test)
   local line = ENEMY_LINES[math.random(1, #ENEMY_LINES)]
   local SWORDS = "\226\154\148"  -- U+2694 crossed swords, as UTF-8 bytes
   local parts = {
@@ -472,6 +480,7 @@ local function enemyMessage(name)
     { text = " has entered the server.\n", color = "gray" },
     { text = line, color = "gold", italic = true },
   }
+  if test then table.insert(parts, { text = "  (test, only the allowed list sees this)", color = "dark_gray", italic = true }) end
   -- unicode_strings turns the UTF-8 symbols into \u escapes Minecraft understands;
   -- older CC versions don't have it, so fall back to plain ASCII.
   local ok, json = pcall(textutils.serializeJSON, parts, { unicode_strings = true })
@@ -480,6 +489,24 @@ local function enemyMessage(name)
     json = textutils.serializeJSON(parts)
   end
   return json, "ENEMY DETECTED: " .. name .. " has entered the server. " .. line
+end
+
+-- Send the enemy announcement only to allowed players who are online, as a test.
+local function testEnemyMessage()
+  if not chat then return "No Chat Box found" end
+  local ok, online = dcall("getOnlinePlayers")
+  if not ok or type(online) ~= "table" then return "Couldn't read the online list" end
+  local name = WATCH_JOINS[1] or "Mechanoo"
+  local json, plain = enemyMessage(name, true)
+  local sent = 0
+  for _, p in ipairs(online) do
+    if isAllowed(p) then
+      table.insert(chatQueue, sent + 1, { player = p, json = json, text = plain })
+      sent = sent + 1
+    end
+  end
+  if sent == 0 then return "No allowed players online to send it to" end
+  return "Test sent to " .. sent .. " allowed player" .. (sent == 1 and "" or "s")
 end
 
 -- Everyone online except the enemy hears about it, enemy alerts first in line.
@@ -724,6 +751,19 @@ local function drawRadar(cx, cy, r, small)
   end
 
   -- Blips: allowed players green, intruders red with a pulse ring
+  local placed = {}
+  local function freeY(lx, ly, lw, lh)
+    for _ = 1, 6 do
+      local hit = false
+      for _, b in ipairs(placed) do
+        if lx < b.x + b.w and lx + lw > b.x and ly < b.y + b.h and ly + lh > b.y then hit = true break end
+      end
+      if not hit then break end
+      ly = ly + lh
+    end
+    table.insert(placed, { x = lx, y = ly, w = lw, h = lh })
+    return ly
+  end
   for _, e in ipairs(nearbyList()) do
     if e.dist then
       local a = blipAngle(e)
@@ -746,7 +786,8 @@ local function drawRadar(cx, cy, r, small)
       local lx = e.allowed and (bx - 7 - lw) or (bx + 7)
       if lx + lw > cx + r then lx = bx - 7 - lw end
       if lx < cx - r then lx = bx + 7 end
-      text(label, lx, by - small * 0.5, e.allowed and GREEN or RED, small * 0.9, e.allowed and "plain" or "bold")
+      local ly = freeY(lx, by - small * 0.5, lw, small)
+      text(label, lx, ly, e.allowed and GREEN or RED, small * 0.9, e.allowed and "plain" or "bold")
     end
   end
   circle(cx, cy, 3, WHITE, true)
@@ -774,12 +815,12 @@ local function detailLines(e)
   local v = active[e.name]
   local st = stats[e.name:lower()]
   local lines = {}
-  table.insert(lines, (e.dist and (math.floor(e.dist) .. "m away") or "distance unknown") .. (e.dx and (", " .. compass(e.dx, e.dz)) or ""))
+  table.insert(lines, (e.dist and (meters(e.dist) .. " away") or "distance unknown") .. (e.dx and (", " .. compass(e.dx, e.dz)) or ""))
   if e.dx and detectorPos then
     table.insert(lines, "at " .. math.floor(detectorPos.x + e.dx) .. ", " .. math.floor(detectorPos.y + e.dy) .. ", " .. math.floor(detectorPos.z + e.dz))
   end
   if v then
-    table.insert(lines, "here " .. fmtDuration(now() - v.first) .. ", closest " .. (v.closest and (math.floor(v.closest) .. "m") or "?"))
+    table.insert(lines, "here " .. fmtDuration(now() - v.first) .. ", closest " .. meters(v.closest))
   end
   if st then table.insert(lines, st.visits .. " past visits, " .. fmtDuration(st.seconds) .. " total") end
   if e.allowed then table.insert(lines, "on the allowed list") end
@@ -830,7 +871,7 @@ local function drawLogPage()
   for i = 1, math.min(5, #people) do
     local st = people[i]
     text(fit(st.name, W * 0.4, small, "bold"), pad * 1.6, y + 2, WHITE, small, "bold")
-    local right = st.visits .. "   " .. fmtDuration(st.seconds) .. "   " .. (st.closest and (math.floor(st.closest) .. "m") or "?")
+    local right = st.visits .. "   " .. fmtDuration(st.seconds) .. "   " .. meters(st.closest)
     textRight(right, W - pad * 1.6, y + 2, AMBER, small)
     y = y + rowH
   end
@@ -854,7 +895,7 @@ local function drawLogPage()
     if i % 2 == 0 then rect(pad, yy - 1, W - pad * 2, rowH, { 18, 21, 27 }) end
     text(fmtWhen(v.first), pad * 1.6, yy + 2, MUTED, small)
     text(fit(v.name, W * 0.33, small, "bold"), pad * 1.6 + textWidth("00/00 00:00  ", small), yy + 2, WHITE, small, "bold")
-    textRight(fmtDuration(v.last - v.first) .. "  " .. (v.closest and (math.floor(v.closest) .. "m") or "?"), W - pad * 1.6, yy + 2, AMBER, small)
+    textRight(fmtDuration(v.last - v.first) .. "  " .. meters(v.closest), W - pad * 1.6, yy + 2, AMBER, small)
   end
   if #visits == 0 then text("No visits logged yet", pad * 1.6, y + 2, MUTED, small) end
 
@@ -978,6 +1019,7 @@ local function drawGpu()
   local list = nearbyList()
   local rowH = medium + 8
   local maxNearby = math.max(1, math.min(4, #list))
+  if #list > 4 then maxNearby = 3 end
   if #list == 0 then
     text("Nobody in range", pad * 1.6, y + 4, MUTED, medium)
     y = y + rowH
@@ -991,33 +1033,38 @@ local function drawGpu()
     local name = e.name
     gpuButton(pad, y - 2, W - pad * 2, rowH, function() selected = (selected ~= name) and name or nil end)
     text(fit(e.name, W * 0.42, medium, "bold"), pad * 1.6, y + 2, WHITE, medium, "bold")
-    local info = e.dist and (math.floor(e.dist) .. "m") or "?"
+    local info = meters(e.dist)
     if e.dx then info = info .. " " .. compass(e.dx, e.dz) end
     local v = active[e.name]
     if v then info = info .. "  " .. fmtDuration(now() - v.first) end
     textRight(info, W - pad * 1.6, y + 2, c, medium, "bold")
     y = y + rowH
   end
+  if #list > maxNearby then
+    text("+" .. (#list - maxNearby) .. " more nearby", pad * 1.6, y + 2, MUTED, small)
+    y = y + small + 6
+  end
   y = y + pad / 2
 
-  -- Visit log
-  rect(pad, y, W - pad * 2, small + pad, PANEL)
-  text("VISIT LOG", pad * 1.6, y + pad / 2, MUTED, small, "bold")
-  textRight(todayCount() .. " today, " .. #visits .. " total", W - pad * 1.6, y + pad / 2, MUTED, small)
-  y = y + small + pad + 2
+  -- Visit log, only if there's room for the header and a row (LOG has the full list)
   local footH = small + pad
   local logRow = small + 7
-  local rows = math.floor((H - footH - y) / logRow)
-  if #visits == 0 then text("No visits logged yet", pad * 1.6, y + 2, MUTED, small) end
-  for i = 0, rows - 1 do
-    local v = visits[#visits - i]
-    if not v then break end
-    local yy = y + i * logRow
-    if i % 2 == 0 then rect(pad, yy - 1, W - pad * 2, logRow, { 18, 21, 27 }) end
-    text(fmtWhen(v.first), pad * 1.6, yy + 2, MUTED, small)
-    text(fit(v.name, W * 0.33, small, "bold"), pad * 1.6 + textWidth("00/00 00:00  ", small), yy + 2, WHITE, small, "bold")
-    local right = fmtDuration(v.last - v.first) .. "  " .. (v.closest and (math.floor(v.closest) .. "m") or "?")
-    textRight(right, W - pad * 1.6, yy + 2, AMBER, small)
+  if y + small + pad + 2 + logRow <= H - footH then
+    rect(pad, y, W - pad * 2, small + pad, PANEL)
+    text("VISIT LOG", pad * 1.6, y + pad / 2, MUTED, small, "bold")
+    textRight(todayCount() .. " today, " .. #visits .. " total", W - pad * 1.6, y + pad / 2, MUTED, small)
+    y = y + small + pad + 2
+    local rows = math.floor((H - footH - y) / logRow)
+    if #visits == 0 then text("No visits logged yet", pad * 1.6, y + 2, MUTED, small) end
+    for i = 0, rows - 1 do
+      local v = visits[#visits - i]
+      if not v then break end
+      local yy = y + i * logRow
+      if i % 2 == 0 then rect(pad, yy - 1, W - pad * 2, logRow, { 18, 21, 27 }) end
+      text(fmtWhen(v.first), pad * 1.6, yy + 2, MUTED, small)
+      text(fit(v.name, W * 0.33, small, "bold"), pad * 1.6 + textWidth("00/00 00:00  ", small), yy + 2, WHITE, small, "bold")
+      textRight(fmtDuration(v.last - v.first) .. "  " .. meters(v.closest), W - pad * 1.6, yy + 2, AMBER, small)
+    end
   end
 
   -- Footer: latest event
@@ -1025,7 +1072,7 @@ local function drawGpu()
   rect(0, fy, W, footH, PANEL)
   local ev = log[1]
   if ev then
-    text(fit(os.date("!%H:%M", math.floor(ev.t + UTC_OFFSET * 3600)) .. "  " .. ev.text, W - pad * 2, small), pad, fy + (footH - small) / 2 - 1, ev.kind == "alert" and RED or MUTED, small)
+    text(fit(os.date("!%H:%M", math.floor(ev.t + UTC_OFFSET * 3600)) .. "  " .. ev.text, W - pad * 2, small), pad, fy + (footH - small) / 2 - 1, ev.kind == "alert" and RED or MUTED, small, ev.kind == "alert" and "bold" or "plain")
   else
     text("Tap a player for details", pad, fy + (footH - small) / 2 - 1, MUTED, small)
   end
@@ -1064,7 +1111,7 @@ local function drawPlain()
   y = y + 1
   for _, e in ipairs(nearbyList()) do
     if y > 12 then break end
-    local info = (e.dist and (math.floor(e.dist) .. "m") or "?") .. (e.dx and (" " .. compass(e.dx, e.dz)) or "")
+    local info = meters(e.dist) .. (e.dx and (" " .. compass(e.dx, e.dz)) or "")
     at(1, y, e.name:sub(1, w - #info - 2), e.allowed and colours.lime or colours.red)
     at(w - #info + 1, y, info, e.allowed and colours.lime or colours.red)
     y = y + 1
@@ -1075,7 +1122,7 @@ local function drawPlain()
   for i = 0, h - y do
     local v = visits[#visits - i]
     if not v then break end
-    local right = fmtDuration(v.last - v.first) .. " " .. (v.closest and (math.floor(v.closest) .. "m") or "?")
+    local right = fmtDuration(v.last - v.first) .. " " .. meters(v.closest)
     at(1, y, (fmtWhen(v.first) .. " " .. v.name):sub(1, w - #right - 1), colours.white)
     at(w - #right + 1, y, right, colours.orange)
     y = y + 1
@@ -1086,7 +1133,13 @@ end
 
 local TW, TH = term.getSize()
 local buttons = {}
-local message = nil
+local message, messageAt = nil, 0
+local tab = "status"
+local confirmClear = 0
+
+local function say(text)
+  message, messageAt = text, now()
+end
 
 local function put(x, y, s, fg, bg)
   term.setCursorPos(x, y)
@@ -1094,114 +1147,213 @@ local function put(x, y, s, fg, bg)
   term.setTextColor(fg or colors.white)
   term.write(s)
 end
-local function button(x, y, label, bg, action)
+local function button(x, y, label, bg, action, fg)
   label = " " .. label .. " "
-  put(x, y, label, colors.white, bg)
+  put(x, y, label, fg or colors.white, bg)
   table.insert(buttons, { x = x, y = y, w = #label, action = action })
   return x + #label + 1
+end
+local function dot(x, y, ok, label, value)
+  put(x, y, "\7", ok and colors.lime or colors.red)
+  put(x + 2, y, label, colors.lightGray)
+  put(x + 2 + #label + 1, y, value, ok and colors.white or colors.red)
 end
 
 local function calibrate()
   local ok, names = dcall("getPlayersInRange", 2)
   if not ok or type(names) ~= "table" or #names ~= 1 then
-    message = "Stand on the detector alone, then press Calibrate"
+    say("Stand on the detector alone, then press Calibrate")
     return
   end
   local info = playerInfo(names[1])
   if not info then
-    message = "Couldn't read your position (getPlayer disabled?)"
+    say("Couldn't read your position (getPlayer disabled?)")
     return
   end
   detectorPos = { x = math.floor(info.x) + 0.5, y = math.floor(info.y) - 0.5, z = math.floor(info.z) + 0.5 }
   writeFile(DIR .. "/detector", detectorPos)
-  message = "Calibrated: detector at " .. math.floor(detectorPos.x) .. ", " .. math.floor(detectorPos.y) .. ", " .. math.floor(detectorPos.z)
+  say("Calibrated: detector at " .. math.floor(detectorPos.x) .. ", " .. math.floor(detectorPos.y) .. ", " .. math.floor(detectorPos.z))
+end
+
+local function allowName(name)
+  allowed[name:lower()] = name
+  saveAllowed()
+  event(name .. " added to the allowed list", "info")
+  say(name .. " is now allowed")
+end
+
+local function drawStatusTab(y)
+  dot(2, y, detector ~= nil, "Detector", detector and ("range " .. RANGE .. "m") or "missing")
+  dot(27, y, chat ~= nil, "Chat Box", chat and "ok" or "none")
+  y = y + 1
+  dot(2, y, useGpu, "Monitor", useGpu and "DirectGPU" or "plain")
+  dot(27, y, speaker ~= nil, "Speaker", speaker and "ok" or "none")
+  y = y + 1
+  dot(2, y, detectorPos ~= nil, "Direction", detectorPos and "calibrated" or "not calibrated")
+  if #radars > 0 then
+    local ships, hostile, unknown = radarSummary()
+    dot(27, y, baseCenter() ~= nil, "Radar", currentMode())
+    y = y + 1
+    put(4, y, ("Radar x" .. #radars .. ": " .. ships .. " ship " .. hostile .. " hostile " .. unknown .. " unknown"):sub(1, TW - 4), colors.lightBlue)
+  else
+    dot(27, y, false, "Radar", "none")
+  end
+  y = y + 1
+  if scanError then
+    put(2, y, scanError:sub(1, TW - 2), colors.red)
+    y = y + 1
+  end
+
+  y = y + 1
+  put(2, y, "Nearby", colors.yellow)
+  y = y + 1
+  local list = nearbyList()
+  if #list == 0 then put(4, y, "nobody in range", colors.gray) end
+  local shown = 0
+  for _, e in ipairs(list) do
+    if y > TH - 2 then
+      put(4, y - 1, "+" .. (#list - shown) .. " more", colors.gray)
+      break
+    end
+    put(2, y, e.allowed and "\7" or "!", e.allowed and colors.lime or colors.red)
+    put(4, y, e.name:sub(1, 17), e.allowed and colors.lime or colors.red)
+    local info = meters(e.dist) .. (e.dx and (" " .. compass(e.dx, e.dz)) or "")
+    put(22, y, info, colors.white)
+    local v = active[e.name]
+    if v then put(31, y, fmtDuration(now() - v.first), colors.gray) end
+    if not e.allowed then
+      local name = e.name
+      button(TW - 8, y, "Allow", colors.green, function() allowName(name) end)
+    end
+    shown = shown + 1
+    y = y + 1
+  end
+end
+
+local function drawPeopleTab(y)
+  put(2, y, "Allowed (never trigger the alarm)", colors.yellow)
+  y = y + 1
+  local names = {}
+  for _, n in pairs(allowed) do table.insert(names, n) end
+  table.sort(names, function(a, b) return a:lower() < b:lower() end)
+  local fromConfig = {}
+  for _, n in ipairs(ALLOWED) do fromConfig[n:lower()] = true end
+  local col, row = 0, 0
+  for _, n in ipairs(names) do
+    local x = 2 + col * 25
+    if y + row > TH - 6 then break end
+    put(x, y + row, n:sub(1, 16), colors.lime)
+    if fromConfig[n:lower()] then
+      put(x + 18, y + row, "file", colors.gray)
+    else
+      button(x + 18, y + row, "x", colors.red, function()
+        allowed[n:lower()] = nil
+        saveAllowed()
+        say(n .. " removed")
+      end)
+    end
+    col = col + 1
+    if col == 2 then col, row = 0, row + 1 end
+  end
+  y = y + row + (col > 0 and 1 or 0) + 1
+  button(2, y, "Add name", colors.blue, function()
+    put(1, TH, string.rep(" ", TW), colors.white, colors.blue)
+    put(1, TH, "Name to allow: ", colors.white, colors.blue)
+    local name = read()
+    if name and name:match("^[%w_]+$") then allowName(name) elseif name ~= "" then say("Names are letters, numbers and _") end
+  end)
+  y = y + 2
+  put(2, y, "Enemies (WATCH_JOINS)", colors.yellow)
+  y = y + 1
+  local enemies = {}
+  for _, n in ipairs(WATCH_JOINS) do
+    local on = watchedOnline[n:lower()] ~= nil
+    table.insert(enemies, n .. (on and " (ONLINE)" or ""))
+  end
+  put(2, y, (#enemies > 0 and table.concat(enemies, ", ") or "none"):sub(1, TW - 2), #enemies > 0 and colors.red or colors.gray)
+end
+
+local function drawToolsTab(y)
+  button(2, y, "Calibrate", colors.blue, calibrate)
+  put(15, y, "stand on the detector alone first", colors.gray)
+  y = y + 2
+  if muted() then
+    button(2, y, "Unmute", colors.orange, function() muteUntil = 0 say("Alarm unmuted") end)
+    put(15, y, "muted for " .. fmtDuration(muteUntil - now()), colors.orange)
+  else
+    button(2, y, "Mute " .. MUTE_MINUTES .. "m", colors.gray, function()
+      muteUntil = now() + MUTE_MINUTES * 60
+      say("Siren and speaker muted for " .. MUTE_MINUTES .. " minutes")
+    end)
+    put(15, y, "silence the siren and speaker", colors.gray)
+  end
+  y = y + 2
+  button(2, y, "Test enemy msg", colors.purple, function() say(testEnemyMessage()) end)
+  put(20, y, "chat, allowed list only", colors.gray)
+  y = y + 2
+  button(2, y, "Test alert", colors.purple, function()
+    if not chat then say("No Chat Box found") return end
+    warnAllowed("This is a test of the intruder alert", "Test alert")
+    say("Test toast sent to the allowed list")
+  end)
+  put(20, y, "toast, allowed list only", colors.gray)
+  y = y + 2
+  local armed = now() - confirmClear < 5
+  button(2, y, armed and "Really clear?" or "Clear log", colors.red, function()
+    if now() - confirmClear < 5 then
+      visits, stats = {}, {}
+      saveVisits()
+      saveStats()
+      confirmClear = 0
+      say("Visit log cleared")
+    else
+      confirmClear = now()
+    end
+  end)
+  put(20, y, #visits .. " visits logged", colors.gray)
 end
 
 local function drawTerminal(useGpu)
   buttons = {}
   term.setBackgroundColor(colors.black)
   term.clear()
-  put(1, 1, string.rep(" ", TW), colors.white, colors.gray)
-  put(2, 1, "PLAYER ALARM", colors.white, colors.gray)
+
   local n = intruderCount()
-  put(TW - 10, 1, n > 0 and (n .. " INTRUDER") or "  SECURE  ", colors.white, n > 0 and colors.red or colors.green)
-
-  put(2, 3, "Detector: " .. (detector and "ok" or "missing") .. "   Chat box: " .. (chat and "ok" or "none") .. "   Speaker: " .. (speaker and "ok" or "none"), colors.lightGray)
-  put(2, 4, "Monitor: " .. (useGpu and "DirectGPU" or "plain") .. "   Direction: " .. (detectorPos and "calibrated" or "not calibrated"), colors.lightGray)
-  if muted() then put(2, 5, "Alarm muted for " .. fmtDuration(muteUntil - now()), colors.orange) end
-  local onlineNames = {}
-  for _, name in pairs(watchedOnline) do table.insert(onlineNames, name) end
-  if #onlineNames > 0 then
-    put(1, 2, string.rep(" ", TW), colors.black, colors.orange)
-    put(2, 2, (table.concat(onlineNames, ", ") .. " online"):sub(1, TW - 2), colors.black, colors.orange)
-  end
-  if #radars > 0 then
-    local ships, hostile, unknown, other = radarSummary()
-    put(2, 5, "Radar x" .. #radars .. " " .. currentMode() .. ": " .. ships .. " ship " .. hostile .. " hostile " .. unknown .. " unknown", colors.lightBlue)
-    if not baseCenter() then put(2, 5, "Radar found: press Calibrate so tracks can be placed", colors.orange) end
-  end
-  if scanError then put(2, 5, scanError, colors.red) end
-
-  local y = 6
-  put(2, y, "Nearby", colors.yellow)
-  y = y + 1
-  for _, e in ipairs(nearbyList()) do
-    if y > TH - 6 then break end
-    local info = e.dist and (math.floor(e.dist) .. "m") or "?"
-    put(2, y, e.name, e.allowed and colors.lime or colors.red)
-    put(20, y, info, colors.white)
-    if not e.allowed then
-      button(28, y, "Allow", colors.green, function()
-        allowed[e.name:lower()] = e.name
-        saveAllowed()
-        event(e.name .. " added to the allowed list", "info")
-        message = e.name .. " added to the allowed list"
-      end)
-    end
-    y = y + 1
-  end
-
-  y = y + 1
-  put(2, y, "Allowed:", colors.yellow)
-  local x = 11
-  local names = {}
-  for _, n2 in pairs(allowed) do table.insert(names, n2) end
-  table.sort(names)
-  for _, n2 in ipairs(names) do
-    if x + #n2 + 4 > TW then y = y + 1 x = 2 end
-    if y > TH - 2 then break end
-    put(x, y, n2, colors.lime)
-    x = x + #n2
-    x = button(x, y, "x", colors.red, function()
-      allowed[n2:lower()] = nil
-      saveAllowed()
-      message = n2 .. " removed"
-    end)
-  end
-
-  local bx = 2
-  bx = button(bx, TH - 1, "Calibrate", colors.blue, calibrate)
-  if muted() then
-    bx = button(bx, TH - 1, "Unmute", colors.orange, function() muteUntil = 0 end)
+  local badge, badgeBg
+  if n > 0 then
+    badge, badgeBg = " " .. n .. " INTRUDER" .. (n > 1 and "S" or "") .. (muted() and " (muted)" or "") .. " ", colors.red
   else
-    bx = button(bx, TH - 1, "Mute", colors.gray, function() muteUntil = now() + MUTE_MINUTES * 60 end)
+    badge, badgeBg = " SECURE ", colors.green
   end
-  bx = button(bx, TH - 1, "Add name", colors.gray, function()
-    put(1, TH, string.rep(" ", TW), colors.white, colors.blue)
-    put(1, TH, "Name to allow: ", colors.white, colors.blue)
-    local name = read()
-    if name and name ~= "" then
-      allowed[name:lower()] = name
-      saveAllowed()
-      message = name .. " added"
-    end
-  end)
-  button(bx, TH - 1, "Clear log", colors.red, function()
-    visits = {}
-    saveVisits()
-    message = "Visit log cleared"
-  end)
-  if message then put(2, TH, message:sub(1, TW - 2), colors.orange) end
+  put(1, 1, string.rep(" ", TW), colors.white, colors.gray)
+  put(2, 1, TITLE, colors.white, colors.gray)
+  put(TW - #badge + 1, 1, badge, colors.white, badgeBg)
+
+  local enemies = {}
+  for _, name in pairs(watchedOnline) do table.insert(enemies, name) end
+  local y = 2
+  if #enemies > 0 then
+    table.sort(enemies)
+    put(1, y, string.rep(" ", TW), colors.black, colors.orange)
+    put(2, y, ("ENEMY ONLINE: " .. table.concat(enemies, ", ")):sub(1, TW - 2), colors.black, colors.orange)
+  end
+  y = 3
+
+  local x = 2
+  for _, t in ipairs({ { "status", "Status" }, { "people", "People" }, { "tools", "Tools" } }) do
+    local on = tab == t[1]
+    x = button(x, y, t[2], on and colors.lightBlue or colors.gray, function() tab = t[1] end, on and colors.black or colors.white)
+  end
+  y = y + 2
+
+  if tab == "status" then drawStatusTab(y)
+  elseif tab == "people" then drawPeopleTab(y)
+  else drawToolsTab(y) end
+
+  if message and now() - messageAt < 8 then
+    put(1, TH, string.rep(" ", TW), colors.white, colors.black)
+    put(2, TH, message:sub(1, TW - 2), colors.orange)
+  end
 end
 
 local useGpu = false
