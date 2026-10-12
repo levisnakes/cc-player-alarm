@@ -19,6 +19,11 @@ UTC_OFFSET = 0            -- hours added to server time for the log (e.g. -5)
 
 DISCORD_WEBHOOK = nil     -- paste a Discord webhook URL here (in quotes) to post alerts to a channel
 DISCORD_MENTION = nil     -- who to ping, e.g. "<@&ROLE_ID>" for a role, "<@USER_ID>" or "@everyone"
+DISCORD_BOT_TOKEN = nil   -- your bot's token, for !commands in Discord (keep it secret)
+DISCORD_CHANNEL_ID = nil  -- the channel ID the bot reads commands from and answers in (in quotes)
+DISCORD_PREFIX = "!"      -- commands start with this
+DISCORD_ADMINS = {}       -- Discord user IDs (in quotes) allowed to !mute and !unmute
+DISCORD_SAY_ANYONE = true -- false = only admins can !say into Minecraft chat
 RADAR_UP = "east"         -- which direction is at the top of the radar: "north", "east", "south" or "west"
 RADAR_MODE = "auto"       -- radar view: "players", "threats" or "all"; "auto" = threats when a Create Radar is found
 SHIP_WARN = false         -- toast the allowed list when a new ship shows up on the radar
@@ -141,6 +146,8 @@ end
 -- ============================================================ scanning
 
 local present = {}      -- [name] = { name, allowed, dist, dx, dz, y, dim }
+local page = "radar"    -- monitor page: radar, people, log or stats
+local lastInput = 0     -- last time someone touched the monitor
 local scanError = nil
 local lastScan = 0
 
@@ -266,7 +273,7 @@ local function onArrive(v)
   event(v.name .. " arrived (" .. where .. ")", "alert")
   warnAllowed("Intruder " .. v.name .. " is " .. where .. " from base", "Intruder alert")
   alertFlash = now() + 6
-  view = "radar"
+  page = "radar"
 end
 
 local function onClose(v)
@@ -710,18 +717,307 @@ local function todayCount()
   return n
 end
 
+-- ============================================================ Discord bot commands
+-- Kept in a block so its many helpers don't count against Lua's limit on
+-- top-level locals; only these three names are visible outside.
+local botState = { status = nil }   -- last problem talking to Discord, shown on the computer
+local botEnabled, botLoop
+do
+
+-- Reads the command channel with your bot's token and answers commands like
+-- !whoonline. Polls the Discord API every few seconds, so nothing else has
+-- to run anywhere.
+local E = {
+  green = "\240\159\159\162", red = "\240\159\148\180", white = "\226\154\170",
+  shield = "\240\159\155\161\239\184\143", swords = "\226\154\148\239\184\143", ship = "\240\159\154\162",
+  check = "\226\156\133", cross = "\226\157\140", mute = "\240\159\148\135", clock = "\240\159\149\146",
+  pin = "\240\159\147\141", scroll = "\240\159\147\156", chat = "\240\159\146\172", warn = "\226\154\160\239\184\143",
+}
+local API = "https://discord.com/api/v10"
+local sayCooldown = {}        -- [user id] = time of their last !say
+
+function botEnabled()
+  return http and DISCORD_BOT_TOKEN and DISCORD_BOT_TOKEN ~= "" and DISCORD_CHANNEL_ID and DISCORD_CHANNEL_ID ~= ""
+end
+
+local function api(method, path, body)
+  local headers = {
+    ["Authorization"] = "Bot " .. DISCORD_BOT_TOKEN,
+    ["User-Agent"] = "DiscordBot (https://github.com/levisnakes/cc-player-alarm, 1.0)",
+  }
+  local ok, res, err, errRes
+  if method == "GET" then
+    ok, res, err, errRes = pcall(http.get, API .. path, headers)
+  else
+    headers["Content-Type"] = "application/json"
+    ok, res, err, errRes = pcall(http.post, API .. path, body, headers)
+  end
+  if not ok then return nil, tostring(res) end
+  if not res then
+    local code = errRes and errRes.getResponseCode and errRes.getResponseCode()
+    if errRes then errRes.close() end
+    if code == 401 then return nil, "bot token rejected (401)" end
+    if code == 403 then return nil, "bot can't see that channel (403)" end
+    if code == 404 then return nil, "channel not found (404), check DISCORD_CHANNEL_ID" end
+    return nil, code and ("Discord HTTP " .. code) or tostring(err)
+  end
+  local text = res.readAll()
+  res.close()
+  return textutils.unserializeJSON(text) or {}, nil
+end
+
+local function json(t)
+  local ok, out = pcall(textutils.serializeJSON, t, { unicode_strings = true })
+  if ok then return out end
+  return textutils.serializeJSON(t)
+end
+
+-- Snowflake IDs are numbers too big for Lua, so compare them as strings.
+local function newer(a, b)
+  if #a ~= #b then return #a > #b end
+  return a > b
+end
+
+local function reply(m, embed)
+  local body = json({
+    embeds = { embed },
+    message_reference = { message_id = m.id },
+    allowed_mentions = { parse = textutils.empty_json_array },
+  })
+  local _, err = api("POST", "/channels/" .. DISCORD_CHANNEL_ID .. "/messages", body)
+  if err then botState.status = "reply failed: " .. err end
+end
+
+local function isAdmin(m)
+  for _, id in ipairs(DISCORD_ADMINS) do
+    if tostring(id) == m.author.id then return true end
+  end
+  return false
+end
+
+local function displayName(m)
+  return m.author.global_name ~= textutils.json_null and m.author.global_name or m.author.username or "someone"
+end
+
+local COMMANDS = {}
+
+COMMANDS.help = function(m)
+  local p = DISCORD_PREFIX
+  reply(m, {
+    title = E.shield .. " " .. TITLE .. " commands",
+    color = 5793266,
+    description = table.concat({
+      "`" .. p .. "whoonline` who's on the server and who's near the base",
+      "`" .. p .. "status` alarm status, intruders and enemies",
+      "`" .. p .. "visits [n]` the last visits to the base",
+      "`" .. p .. "where <player>` how far a player is from the base",
+      "`" .. p .. "say <message>` post a message in Minecraft chat",
+      "`" .. p .. "mute [minutes]` / `" .. p .. "unmute` silence the alarm (admins)",
+    }, "\n"),
+  })
+end
+
+COMMANDS.whoonline = function(m)
+  local ok, online = dcall("getOnlinePlayers")
+  if not ok or type(online) ~= "table" then
+    reply(m, { title = E.cross .. " Can't read the online list", color = 15158332 })
+    return
+  end
+  table.sort(online, function(a, b) return a:lower() < b:lower() end)
+  local lines = {}
+  for _, p in ipairs(online) do
+    if watched[p:lower()] then
+      table.insert(lines, E.red .. " **" .. p .. "** - ENEMY")
+    elseif isAllowed(p) then
+      table.insert(lines, E.green .. " " .. p)
+    else
+      table.insert(lines, E.white .. " " .. p)
+    end
+  end
+  local near = {}
+  for _, e in ipairs(nearbyList()) do
+    table.insert(near, (e.allowed and E.green or E.red) .. " " .. e.name .. ": " .. meters(e.dist) .. (e.dx and (" " .. compass(e.dx, e.dz)) or ""))
+  end
+  reply(m, {
+    title = "Online now (" .. #online .. ")",
+    color = 3447003,
+    description = #lines > 0 and table.concat(lines, "\n") or "nobody",
+    fields = { { name = E.pin .. " Near the base", value = #near > 0 and table.concat(near, "\n") or "nobody in range" } },
+    footer = { text = E.green .. " allowed  " .. E.red .. " enemy  " .. E.white .. " other" },
+  })
+end
+
+COMMANDS.status = function(m)
+  local n = intruderCount()
+  local enemies = {}
+  for _, name in pairs(watchedOnline) do table.insert(enemies, name) end
+  local intruderNames = {}
+  for name in pairs(active) do table.insert(intruderNames, name) end
+  local fields = {
+    { name = "Intruders", value = n > 0 and table.concat(intruderNames, ", ") or "none", inline = true },
+    { name = "Enemies online", value = #enemies > 0 and table.concat(enemies, ", ") or "none", inline = true },
+    { name = "Alarm", value = muted() and (E.mute .. " muted for " .. fmtDuration(muteUntil - now())) or "armed", inline = true },
+    { name = "Visits today", value = tostring(todayCount()), inline = true },
+  }
+  if #radars > 0 then
+    local ships, hostile, unknown, _, contraptions = radarSummary()
+    table.insert(fields, { name = "Radar", value = ships .. " ships, " .. contraptions .. " contraptions, " .. hostile .. " hostile, " .. unknown .. " unknown players", inline = false })
+  end
+  reply(m, {
+    title = n > 0 and (E.warn .. " " .. n .. " INTRUDER" .. (n > 1 and "S" or "")) or (E.shield .. " Base secure"),
+    color = n > 0 and 15158332 or 3066993,
+    fields = fields,
+  })
+end
+
+COMMANDS.visits = function(m, args)
+  local count = math.max(1, math.min(15, tonumber(args[1]) or 5))
+  local lines = {}
+  for i = #visits, math.max(1, #visits - count + 1), -1 do
+    local v = visits[i]
+    table.insert(lines, "`" .. fmtWhen(v.first) .. "` **" .. v.name .. "** stayed " .. fmtDuration(v.last - v.first) .. ", closest " .. meters(v.closest))
+  end
+  reply(m, {
+    title = E.scroll .. " Last " .. #lines .. " visit" .. (#lines == 1 and "" or "s"),
+    color = 15844367,
+    description = #lines > 0 and table.concat(lines, "\n") or "no visits logged yet",
+  })
+end
+
+COMMANDS.where = function(m, args)
+  local who = args[1]
+  if not who then reply(m, { title = "Usage: " .. DISCORD_PREFIX .. "where <player>", color = 9807270 }) return end
+  for name, e in pairs(present) do
+    if name:lower() == who:lower() then
+      local c = baseCenter()
+      local desc = meters(e.dist) .. " from the base" .. (e.dx and (", " .. compass(e.dx, e.dz)) or "")
+      if c and e.dx then desc = desc .. "\nat " .. math.floor(c.x + e.dx) .. ", " .. math.floor(c.y + e.dy) .. ", " .. math.floor(c.z + e.dz) end
+      reply(m, { title = E.pin .. " " .. name, color = e.allowed and 3066993 or 15158332, description = desc })
+      return
+    end
+  end
+  reply(m, { title = E.pin .. " " .. who .. " isn't near the base", color = 9807270 })
+end
+
+COMMANDS.say = function(m, args, rest)
+  if not DISCORD_SAY_ANYONE and not isAdmin(m) then
+    reply(m, { title = E.cross .. " Only admins can use " .. DISCORD_PREFIX .. "say", color = 15158332 })
+    return
+  end
+  if not chat then reply(m, { title = E.cross .. " No Chat Box on the computer", color = 15158332 }) return end
+  if rest == "" then reply(m, { title = "Usage: " .. DISCORD_PREFIX .. "say <message>", color = 9807270 }) return end
+  local last = sayCooldown[m.author.id]
+  if last and now() - last < 10 then
+    reply(m, { title = E.clock .. " Slow down, one message every 10 seconds", color = 15844367 })
+    return
+  end
+  sayCooldown[m.author.id] = now()
+  local ok, online = dcall("getOnlinePlayers")
+  if not ok or type(online) ~= "table" or #online == 0 then
+    reply(m, { title = "Nobody is online to see it", color = 9807270 })
+    return
+  end
+  local text = rest:sub(1, 200):gsub("[%c]", " ")
+  local parts = {
+    { text = "Discord ", color = "blue", bold = true },
+    { text = displayName(m), color = "aqua", bold = true },
+    { text = ": ", color = "dark_gray" },
+    { text = text, color = "white" },
+  }
+  local okJ, msgJson = pcall(textutils.serializeJSON, parts, { unicode_strings = true })
+  if not okJ then msgJson = textutils.serializeJSON(parts) end
+  for _, p in ipairs(online) do
+    table.insert(chatQueue, { player = p, json = msgJson, text = displayName(m) .. ": " .. text })
+  end
+  reply(m, { title = E.chat .. " Sent to " .. #online .. " player" .. (#online == 1 and "" or "s"), color = 3066993, description = text })
+end
+
+COMMANDS.mute = function(m, args)
+  if not isAdmin(m) then reply(m, { title = E.cross .. " Only admins can mute the alarm", color = 15158332 }) return end
+  local minutes = math.max(1, math.min(120, tonumber(args[1]) or MUTE_MINUTES))
+  muteUntil = now() + minutes * 60
+  event("Alarm muted from Discord by " .. displayName(m), "info")
+  reply(m, { title = E.mute .. " Alarm muted for " .. minutes .. " minutes", color = 15844367 })
+end
+
+COMMANDS.unmute = function(m)
+  if not isAdmin(m) then reply(m, { title = E.cross .. " Only admins can unmute the alarm", color = 15158332 }) return end
+  muteUntil = 0
+  event("Alarm unmuted from Discord by " .. displayName(m), "info")
+  reply(m, { title = E.check .. " Alarm armed again", color = 3066993 })
+end
+COMMANDS.online = COMMANDS.whoonline
+COMMANDS.who = COMMANDS.whoonline
+
+local function handleMessage(m)
+  if type(m) ~= "table" or type(m.author) ~= "table" or m.author.bot == true then return end
+  local content = m.content
+  if type(content) ~= "string" then return end
+  if content == "" and (not m.attachments or #m.attachments == 0) and (not m.embeds or #m.embeds == 0) then
+    botState.status = "turn on Message Content Intent"
+    return
+  end
+  if content:sub(1, #DISCORD_PREFIX) ~= DISCORD_PREFIX then return end
+  local body = content:sub(#DISCORD_PREFIX + 1)
+  local cmd, rest = body:match("^(%S+)%s*(.*)$")
+  if not cmd then return end
+  local fn = COMMANDS[cmd:lower()]
+  if not fn then return end
+  local args = {}
+  for a in rest:gmatch("%S+") do table.insert(args, a) end
+  local ok, err = pcall(fn, m, args, rest)
+  if not ok then
+    botState.status = "command error: " .. tostring(err)
+    reply(m, { title = E.cross .. " Something went wrong", color = 15158332, description = tostring(err):sub(1, 200) })
+  end
+end
+
+function botLoop()
+  local lastId = nil
+  while true do
+    if botEnabled() then
+      local path = "/channels/" .. DISCORD_CHANNEL_ID .. "/messages?limit=" .. (lastId and ("20&after=" .. lastId) or "1")
+      local msgs, err = api("GET", path)
+      if not msgs then
+        botState.status = err
+        sleep(10)
+      else
+        if botState.status and not botState.status:find("Intent") then botState.status = nil end
+        if not lastId then
+          -- start from the newest message, so old commands aren't replayed
+          lastId = (msgs[1] and msgs[1].id) or "0"
+        else
+          table.sort(msgs, function(a, b) return newer(b.id, a.id) end)
+          for _, m in ipairs(msgs) do
+            if type(m.id) == "string" and newer(m.id, lastId) then lastId = m.id end
+            handleMessage(m)
+          end
+        end
+        sleep(3)
+      end
+    else
+      sleep(10)
+    end
+  end
+end
+end
+
 -- ============================================================ DirectGPU screen
 
 local gpu, display, W, H
 local gpuError = nil
-local view = "radar"     -- "radar" or "log"
-local viewAt = 0
 local zoom = RANGE        -- radar scale in blocks (view only)
 local selected = nil      -- player name, or "track:<id>" for a radar track
 local radarHits = {}      -- { x, y, key } for everything drawn on the radar this frame
 local gpuButtons = {}
 local function gpuButton(x, y, w, h, action)
   table.insert(gpuButtons, { x = x, y = y, w = w, h = h, action = action })
+end
+
+-- Where the viewer is looking on the screen (DirectGPU hover events).
+local hover = { x = -1, y = -1, at = 0 }
+local function hovered(x, y, w, h)
+  return now() - hover.at < 1.5 and hover.x >= x and hover.x <= x + w and hover.y >= y and hover.y <= y + h
 end
 
 local FONT = "SansSerif"
@@ -1002,6 +1298,7 @@ local function drawRadar(cx, cy, r, small)
 end
 
 local function pill(x, y, w, h, label, bg, fg, size, action)
+  if action and hovered(x, y, w, h) then bg = mix(bg, { 255, 255, 255 }, 0.15) end
   rect(x, y, w, h, bg)
   local lw = textWidth(label, size, "bold")
   text(label, x + (w - lw) / 2, y + (h - size) / 2 - 1, fg, size, "bold")
@@ -1089,120 +1386,71 @@ local function drawDetails(e, x, bottom, w, small, medium)
   end
 end
 
-local function drawLogPage()
-  local pad = math.max(8, math.floor(W * 0.03))
-  local small = math.max(10, math.floor(W * 0.03))
-  local medium = math.max(12, math.floor(W * 0.04))
-  local big = math.max(16, math.floor(W * 0.06))
+-- Pages live in a block so their helpers stay out of the top-level local count.
+local scroll = { people = 0, log = 0, stats = 0 }
+local drawGpu
+do
+-- ---------------------------------------------------------------- pages, scrolling, hover
 
-  gpu.clear(display, BG[1], BG[2], BG[3])
-  local headH = big + pad * 2
-  rect(0, 0, W, headH, PANEL)
-  text("VISIT LOG", pad, pad - 1, WHITE, big, "bold")
-  local bw = textWidth("BACK", small, "bold") + pad * 2
-  pill(W - pad - bw, (headH - (small + pad)) / 2, bw, small + pad, "BACK", { 50, 56, 66 }, WHITE, small, function() view = "radar" end)
-  textRight(todayCount() .. " today", W - pad * 2 - bw, (headH - medium) / 2, MUTED, medium)
-  local y = headH + pad
+local PAGES = { { "radar", "RADAR" }, { "people", "PEOPLE" }, { "log", "LOG" }, { "stats", "STATS" } }
+local expanded = {}          -- [row key] = true while a row is opened up
+local logFilter = "all"      -- "all", "today" or "week"
 
-  -- Repeat visitors
-  local people = {}
-  for _, st in pairs(stats) do table.insert(people, st) end
-  table.sort(people, function(a, b)
-    if a.visits ~= b.visits then return a.visits > b.visits end
-    return (a.last or 0) > (b.last or 0)
-  end)
-  rect(pad, y, W - pad * 2, small + pad, PANEL)
-  text("VISITORS", pad * 1.6, y + pad / 2, MUTED, small, "bold")
-  textRight("visits   time   closest", W - pad * 1.6, y + pad / 2, MUTED, small)
-  y = y + small + pad + 2
-  local rowH = small + 7
-  for i = 1, math.min(5, #people) do
-    local st = people[i]
-    text(fit(st.name, W * 0.4, small, "bold"), pad * 1.6, y + 2, WHITE, small, "bold")
-    local right = st.visits .. "   " .. fmtDuration(st.seconds) .. "   " .. meters(st.closest)
-    textRight(right, W - pad * 1.6, y + 2, AMBER, small)
-    y = y + rowH
-  end
-  if #people == 0 then
-    text("Nobody yet", pad * 1.6, y + 2, MUTED, small)
-    y = y + rowH
-  end
-  y = y + pad / 2
-
-  -- Every visit, newest first
-  rect(pad, y, W - pad * 2, small + pad, PANEL)
-  text("WHEN", pad * 1.6, y + pad / 2, MUTED, small, "bold")
-  text("WHO", pad * 1.6 + textWidth("00/00 00:00  ", small), y + pad / 2, MUTED, small, "bold")
-  textRight("STAYED  CLOSEST", W - pad * 1.6, y + pad / 2, MUTED, small, "bold")
-  y = y + small + pad + 2
-  local rows = math.floor((H - small - pad * 2 - y) / rowH)
-  for i = 0, rows - 1 do
-    local v = visits[#visits - i]
-    if not v then break end
-    local yy = y + i * rowH
-    if i % 2 == 0 then rect(pad, yy - 1, W - pad * 2, rowH, { 18, 21, 27 }) end
-    text(fmtWhen(v.first), pad * 1.6, yy + 2, MUTED, small)
-    text(fit(v.name, W * 0.33, small, "bold"), pad * 1.6 + textWidth("00/00 00:00  ", small), yy + 2, WHITE, small, "bold")
-    textRight(fmtDuration(v.last - v.first) .. "  " .. meters(v.closest), W - pad * 1.6, yy + 2, AMBER, small)
-  end
-  if #visits == 0 then text("No visits logged yet", pad * 1.6, y + 2, MUTED, small) end
-
-  text("Tap BACK for the radar", pad, H - small - pad / 2, MUTED, small)
-  gpu.updateDisplay(display)
+local function dayStart(t)
+  local local_ = t + UTC_OFFSET * 3600
+  return math.floor(local_ / 86400) * 86400 - UTC_OFFSET * 3600
 end
 
-local function drawGpu()
-  gpuButtons = {}
-  if view == "log" then return drawLogPage() end
-  local pad = math.max(8, math.floor(W * 0.03))
-  local small = math.max(10, math.floor(W * 0.03))
-  local medium = math.max(12, math.floor(W * 0.04))
-  local big = math.max(16, math.floor(W * 0.06))
-  local intruders = intruderCount()
+local function dayLabel(t)
+  local today = dayStart(now())
+  local d = dayStart(t)
+  if d == today then return "Today" end
+  if d == today - 86400 then return "Yesterday" end
+  return os.date("!%a %m/%d", math.floor(t + UTC_OFFSET * 3600))
+end
 
-  gpu.clear(display, BG[1], BG[2], BG[3])
+local function timeOfDay(t)
+  return os.date("!%H:%M", math.floor(t + UTC_OFFSET * 3600))
+end
 
-  -- Header
-  local headH = big + pad * 2
-  rect(0, 0, W, headH, PANEL)
-  text(TITLE, pad, pad - 1, WHITE, big, "bold")
-  textRight(clockText(), W - pad, (headH - medium) / 2, WHITE, medium, "bold")
-
-  -- Status banner
-  local y = headH + pad
-  local bannerH = big + pad * 2
-  if scanError then
-    rect(pad, y, W - pad * 2, bannerH, AMBER)
-    text(fit(scanError, W - pad * 4, medium, "bold"), pad * 2, y + (bannerH - medium) / 2, BG, medium, "bold")
-  elseif intruders > 0 then
-    local flash = (math.floor(now() * 2) % 2 == 0) and RED or DARKRED
-    rect(pad, y, W - pad * 2, bannerH, flash)
-    local msg = intruders == 1 and "INTRUDER ALERT" or (intruders .. " INTRUDERS")
-    if muted() then msg = msg .. " (MUTED)" end
-    local mw = textWidth(msg, big, "bold")
-    text(msg, (W - mw) / 2, y + (bannerH - big) / 2 - 1, WHITE, big, "bold")
-  else
-    rect(pad, y, W - pad * 2, bannerH, { 22, 70, 44 })
-    local msg = "SECURE"
-    local mw = textWidth(msg, big, "bold")
-    text(msg, (W - mw) / 2, y + (bannerH - big) / 2 - 1, GREEN, big, "bold")
+-- Draws a list of { h, draw(y), onTap, key } items inside [top, bottom],
+-- scrolled by scroll[name], with a scrollbar. Items that don't fully fit
+-- in view are skipped, which keeps everything inside the area.
+local function scrollList(name, x, top, w, bottom, items)
+  local total = 0
+  for _, it in ipairs(items) do total = total + it.h end
+  local viewH = bottom - top
+  local maxScroll = math.max(0, total - viewH)
+  scroll[name] = math.max(0, math.min(scroll[name] or 0, maxScroll))
+  local y = top - scroll[name]
+  for _, it in ipairs(items) do
+    if y >= top - 0.5 and y + it.h <= bottom + 0.5 then
+      if it.onTap and hovered(x, y, w, it.h) then rect(x, y, w, it.h, { 30, 35, 44 }) end
+      it.draw(y)
+      if it.onTap then gpuButton(x, y, w, it.h, it.onTap) end
+    end
+    y = y + it.h
   end
-  y = y + bannerH + pad
-
-  local watchNames = {}
-  for _, name in pairs(watchedOnline) do table.insert(watchNames, name) end
-  if #watchNames > 0 then
-    table.sort(watchNames)
-    local stripH = small + pad
-    rect(pad, y, W - pad * 2, stripH, AMBER)
-    local msg = "ENEMY ONLINE: " .. table.concat(watchNames, ", ")
-    text(fit(msg, W - pad * 4, small, "bold"), pad * 2, y + (stripH - small) / 2 - 1, BG, small, "bold")
-    y = y + stripH + pad / 2
+  if maxScroll > 0 then
+    local trackX = x + w + 3
+    rect(trackX, top, 4, viewH, { 34, 38, 46 })
+    local thumbH = math.max(24, viewH * viewH / total)
+    local thumbY = top + (viewH - thumbH) * scroll[name] / maxScroll
+    rect(trackX, thumbY, 4, thumbH, { 120, 128, 140 })
+    -- small arrow when there's more above
+    if scroll[name] > 0 then
+      for i = 0, 3 do rect(trackX + 2 - i, top - 6 + i, 1 + i * 2, 1, { 120, 128, 140 }) end
+    end
   end
+  return maxScroll
+end
 
-  -- Toolbar: zoom, log, mute
+-- ---------------------------------------------------------------- radar page
+
+local function drawRadarPage(top, bottom, pad, small, medium)
+  local y = top
   local tbH = small + pad
-  local bw = math.floor((W - pad * 2 - pad * 4) / 5)
+  local bw = math.floor((W - pad * 2 - pad * 3) / 4)
   local x = pad
   local BTN = { 50, 56, 66 }
   pill(x, y, bw, tbH, "-", BTN, WHITE, medium, function() zoomStep(-1) end)
@@ -1220,8 +1468,6 @@ local function drawGpu()
     mode = MODES[idx % #MODES + 1]
     writeFile(DIR .. "/mode", mode)
   end)
-  x = x + bw + pad
-  pill(x, y, bw, tbH, "LOG", BTN, WHITE, small, function() view = "log" viewAt = now() end)
   x = x + bw + pad
   if muted() then
     local left = math.ceil(muteUntil - now())
@@ -1241,11 +1487,23 @@ local function drawGpu()
   end
   y = y + tbH + pad
 
-  -- Radar, with the selected player's details over its lower half
-  local r = math.min((W - pad * 2) / 2, H * 0.21)
-  drawRadar(W / 2, y + r, r, small)
-  -- Tap a blip for details; tap empty radar to close them.
+  -- summary line under the radar
+  local list = nearbyList()
+  local parts = { #list .. (#list == 1 and " player" or " players") }
+  if #radars > 0 then
+    local ships, hostile, unknown, _, contraptions = radarSummary()
+    if ships > 0 then table.insert(parts, ships .. (ships == 1 and " ship" or " ships")) end
+    if contraptions > 0 then table.insert(parts, contraptions .. " contr.") end
+    if hostile > 0 then table.insert(parts, hostile .. " hostile") end
+    if unknown > 0 then table.insert(parts, unknown .. " unknown") end
+  end
+  table.insert(parts, "view " .. zoom .. "m")
+  local summary = table.concat(parts, "  |  ")
+  local sumH = small + pad
+
+  local r = math.min((W - pad * 2) / 2, (bottom - y - sumH - pad) / 2)
   local rcx, rcy = W / 2, y + r
+  drawRadar(rcx, rcy, r, small)
   gpuButton(rcx - r, rcy - r, r * 2, r * 2, function(px, py)
     local best, bestD = nil, 18
     for _, h in ipairs(radarHits) do
@@ -1258,115 +1516,346 @@ local function drawGpu()
     local e
     if selected:sub(1, 6) == "track:" then
       local id = selected:sub(7)
-      for _, t in ipairs(tracks) do
-        if t.id == id then e = { track = t } end
-      end
+      for _, t in ipairs(tracks) do if t.id == id then e = { track = t } end end
     else
       e = present[selected]
     end
-    if e then
-      drawDetails(e, pad * 2, y + r * 2, W - pad * 4, small, medium)
-    else
-      selected = nil
-    end
+    if e then drawDetails(e, pad * 2, y + r * 2, W - pad * 4, small, medium) else selected = nil end
   end
-  y = y + r * 2 + pad
+  y = y + r * 2 + pad / 2
 
-  -- Nearby players
-  rect(pad, y, W - pad * 2, small + pad, PANEL)
-  text("NEARBY", pad * 1.6, y + pad / 2, MUTED, small, "bold")
-  local hdr = "view " .. zoom .. "m"
-  if #radars > 0 then
-    local ships, hostile, unknown, _, contraptions = radarSummary()
-    local parts = {}
-    if ships > 0 then table.insert(parts, ships .. (ships == 1 and " ship" or " ships")) end
-    if contraptions > 0 then table.insert(parts, contraptions .. " contr.") end
-    if hostile > 0 then table.insert(parts, hostile .. " hostile") end
-    if unknown > 0 then table.insert(parts, unknown .. " unknown") end
-    if #parts == 0 then table.insert(parts, "radar clear") end
-    hdr = table.concat(parts, ", ") .. "  |  " .. hdr
+  local sw = textWidth(summary, small)
+  local sx = (W - sw) / 2
+  if hovered(pad, y, W - pad * 2, sumH) then rect(pad, y, W - pad * 2, sumH, { 30, 35, 44 }) end
+  text(fit(summary, W - pad * 2, small), math.max(pad, sx), y + (sumH - small) / 2 - 1, MUTED, small)
+  gpuButton(pad, y, W - pad * 2, sumH, function() page = "people" end)
+end
+
+-- ---------------------------------------------------------------- people page
+
+local function sectionItem(label, color, small, pad)
+  return { h = small + pad + 4, draw = function(y)
+    text(label, pad * 1.4, y + pad / 2 + 2, color, small, "bold")
+    rect(pad, y + small + pad, W - pad * 2 - 8, 1, { 44, 50, 60 })
+  end }
+end
+
+local function personRowItems(items, key, title, right, color, details, pad, small, medium)
+  local open = expanded[key]
+  local rowH = medium + 14
+  local lineH = small + 5
+  local h = rowH + (open and (#details * lineH + small + pad + 8) or 0)
+  table.insert(items, { h = h + 4, key = key, onTap = function()
+    expanded[key] = not expanded[key] or nil
+  end, draw = function(y)
+    rect(pad, y, W - pad * 2 - 8, h, PANEL)
+    rect(pad, y, 4, h, color)
+    text(fit(title, W * 0.48, medium, "bold"), pad * 1.8, y + 7, WHITE, medium, "bold")
+    textRight(fit(right, W * 0.42, small, "bold"), W - pad * 2 - 8, y + 9, color, small, "bold")
+    if open then
+      local yy = y + rowH
+      for _, l in ipairs(details) do
+        text(fit(l, W - pad * 5, small), pad * 1.8, yy, MUTED, small)
+        yy = yy + lineH
+      end
+      -- jump to it on the radar
+      local bw = textWidth("SHOW ON RADAR", small * 0.85, "bold") + pad * 2
+      pill(pad * 1.8, yy + 4, bw, small + 8, "SHOW ON RADAR", { 40, 70, 110 }, WHITE, small * 0.85, function()
+        selected = key
+        page = "radar"
+      end)
+    end
+  end })
+end
+
+local function drawPeoplePage(top, bottom, pad, small, medium)
+  local items = {}
+  local intruders, friends = {}, {}
+  for _, e in ipairs(nearbyList()) do
+    if e.allowed then table.insert(friends, e) else table.insert(intruders, e) end
   end
-  textRight(fit(hdr, W * 0.7, small), W - pad * 1.6, y + pad / 2, MUTED, small)
-  y = y + small + pad + 2
-  local list = nearbyList()
-  local ships = shipList()
-  local rowH = medium + 8
-  local slots = (#ships > 0) and 3 or 4
-  local maxNearby = math.max(1, math.min(slots, #list))
-  if #list > slots then maxNearby = slots - 1 end
-  if #list == 0 then
-    text("Nobody in range", pad * 1.6, y + 4, MUTED, medium)
-    y = y + rowH
-  end
-  for i = 1, maxNearby do
-    local e = list[i]
-    if not e then break end
-    local c = e.allowed and GREEN or RED
-    if e.name == selected then rect(pad, y - 2, W - pad * 2, rowH, { 32, 37, 46 }) end
-    rect(pad, y, 4, rowH - 4, c)
-    local name = e.name
-    gpuButton(pad, y - 2, W - pad * 2, rowH, function() selected = (selected ~= name) and name or nil end)
-    text(fit(e.name, W * 0.42, medium, "bold"), pad * 1.6, y + 2, WHITE, medium, "bold")
-    local info = meters(e.dist)
-    if e.dx then info = info .. " " .. compass(e.dx, e.dz) end
+  local function playerRow(e)
+    local info = meters(e.dist) .. (e.dx and (" " .. compass(e.dx, e.dz)) or "")
     local v = active[e.name]
     if v then info = info .. "  " .. fmtDuration(now() - v.first) end
-    textRight(info, W - pad * 1.6, y + 2, c, medium, "bold")
-    y = y + rowH
+    personRowItems(items, e.name, e.name, info, e.allowed and GREEN or RED, detailLines(e), pad, small, medium)
   end
-  if #list > maxNearby then
-    text("+" .. (#list - maxNearby) .. " more nearby", pad * 1.6, y + 2, MUTED, small)
-    y = y + small + 6
+  if #intruders > 0 then
+    table.insert(items, sectionItem("INTRUDERS (" .. #intruders .. ")", RED, small, pad))
+    for _, e in ipairs(intruders) do playerRow(e) end
   end
-  for i = 1, math.min(2, #ships) do
-    local e = ships[i]
-    local kind, SHIPC = vesselKind(e)
-    local key = "track:" .. e.id
-    if key == selected then rect(pad, y - 2, W - pad * 2, rowH, { 32, 37, 46 }) end
-    gpuButton(pad, y - 2, W - pad * 2, rowH, function() selected = (selected ~= key) and key or nil end)
-    rect(pad, y, 4, rowH - 4, SHIPC)
-    text(kind .. " " .. (e.number or "?"), pad * 1.6, y + 2, SHIPC, medium, "bold")
-    textRight(meters(e.dist) .. " " .. compass(e.dx, e.dz) .. "  " .. shipSpeedText(e), W - pad * 1.6, y + 2, SHIPC, medium, "bold")
-    y = y + rowH
+  table.insert(items, sectionItem("ALLOWED (" .. #friends .. ")", GREEN, small, pad))
+  if #friends == 0 then
+    table.insert(items, { h = small + pad, draw = function(y) text("nobody from the allowed list nearby", pad * 1.8, y + 4, MUTED, small) end })
   end
-  if #ships > 2 then
-    text("+" .. (#ships - 2) .. " more on radar", pad * 1.6, y + 2, MUTED, small)
-    y = y + small + 6
-  end
-  y = y + pad / 2
+  for _, e in ipairs(friends) do playerRow(e) end
 
-  -- Visit log, only if there's room for the header and a row (LOG has the full list)
-  local footH = small + pad
-  local logRow = small + 7
-  if y + small + pad + 2 + logRow <= H - footH then
-    rect(pad, y, W - pad * 2, small + pad, PANEL)
-    text("VISIT LOG", pad * 1.6, y + pad / 2, MUTED, small, "bold")
-    textRight(todayCount() .. " today, " .. #visits .. " total", W - pad * 1.6, y + pad / 2, MUTED, small)
-    y = y + small + pad + 2
-    local rows = math.floor((H - footH - y) / logRow)
-    if #visits == 0 then text("No visits logged yet", pad * 1.6, y + 2, MUTED, small) end
-    for i = 0, rows - 1 do
-      local v = visits[#visits - i]
-      if not v then break end
-      local yy = y + i * logRow
-      if i % 2 == 0 then rect(pad, yy - 1, W - pad * 2, logRow, { 18, 21, 27 }) end
-      text(fmtWhen(v.first), pad * 1.6, yy + 2, MUTED, small)
-      text(fit(v.name, W * 0.33, small, "bold"), pad * 1.6 + textWidth("00/00 00:00  ", small), yy + 2, WHITE, small, "bold")
-      textRight(fmtDuration(v.last - v.first) .. "  " .. meters(v.closest), W - pad * 1.6, yy + 2, AMBER, small)
+  local vessels = shipList()
+  if #radars > 0 then
+    table.insert(items, sectionItem("VESSELS (" .. #vessels .. ")", SHIP_COLOR, small, pad))
+    if #vessels == 0 then
+      table.insert(items, { h = small + pad, draw = function(y) text("no ships or contraptions on the radar", pad * 1.8, y + 4, MUTED, small) end })
+    end
+    for _, t in ipairs(vessels) do
+      local kind, c = vesselKind(t)
+      local title, _, lines = trackDetails(t)
+      personRowItems(items, "track:" .. t.id, title, meters(t.dist) .. " " .. compass(t.dx, t.dz) .. "  " .. shipSpeedText(t), c, lines, pad, small, medium)
+    end
+    local unknown = {}
+    for _, t in ipairs(tracks) do
+      if t.category == "PLAYER" and not t.name and t.dist then table.insert(unknown, t) end
+    end
+    if #unknown > 0 then
+      table.insert(items, sectionItem("UNKNOWN PLAYERS (" .. #unknown .. ")", AMBER, small, pad))
+      for i, t in ipairs(unknown) do
+        local _, _, lines = trackDetails(t)
+        personRowItems(items, "track:" .. t.id, "Unknown player " .. i, meters(t.dist) .. " " .. compass(t.dx, t.dz), AMBER, lines, pad, small, medium)
+      end
     end
   end
+  scrollList("people", pad, top, W - pad * 2 - 8, bottom, items)
+end
+
+-- ---------------------------------------------------------------- log page
+
+local function drawLogPageNew(top, bottom, pad, small, medium)
+  -- filter chips
+  local chips = { { "all", "ALL" }, { "today", "TODAY" }, { "week", "7 DAYS" } }
+  local x = pad
+  local chipH = small + 10
+  for _, c in ipairs(chips) do
+    local on = logFilter == c[1]
+    local cw = textWidth(c[2], small * 0.9, "bold") + pad * 2
+    pill(x, top, cw, chipH, c[2], on and { 40, 70, 110 } or { 40, 44, 52 }, on and WHITE or MUTED, small * 0.9, function()
+      logFilter = c[1]
+      scroll.log = 0
+    end)
+    x = x + cw + pad / 2
+  end
+  textRight(#visits .. " visits logged", W - pad, top + (chipH - small) / 2, MUTED, small)
+  local listTop = top + chipH + pad / 2
+
+  local cutoff = 0
+  if logFilter == "today" then cutoff = dayStart(now())
+  elseif logFilter == "week" then cutoff = dayStart(now()) - 6 * 86400 end
+
+  local counts = {}
+  local items = {}
+  local lastDay = nil
+  for i = #visits, 1, -1 do
+    local v = visits[i]
+    if v.first >= cutoff then
+      local d = dayLabel(v.first)
+      if d ~= lastDay then
+        table.insert(items, sectionItem(d:upper(), MUTED, small, pad))
+        lastDay = d
+      end
+      local key = "visit:" .. i
+      local open = expanded[key]
+      local rowH = small + 12
+      local lineH = small + 5
+      local h = rowH + (open and (3 * lineH + 6) or 0)
+      table.insert(items, { h = h + 2, onTap = function() expanded[key] = not expanded[key] or nil end, draw = function(y)
+        if i % 2 == 0 then rect(pad, y, W - pad * 2 - 8, h, { 20, 23, 29 }) end
+        text(timeOfDay(v.first), pad * 1.4, y + 6, MUTED, small)
+        text(fit(v.name, W * 0.36, small, "bold"), pad * 1.4 + textWidth("00:00  ", small), y + 6, WHITE, small, "bold")
+        textRight(fmtDuration(v.last - v.first) .. "   " .. meters(v.closest), W - pad * 2 - 8, y + 6, AMBER, small)
+        if open then
+          local st = stats[v.name:lower()]
+          local yy = y + rowH
+          text("from " .. timeOfDay(v.first) .. " to " .. timeOfDay(v.last), pad * 2.4, yy, MUTED, small) yy = yy + lineH
+          text("closest " .. meters(v.closest) .. " to the base", pad * 2.4, yy, MUTED, small) yy = yy + lineH
+          if st then text(st.visits .. " visits from this player, " .. fmtDuration(st.seconds) .. " total", pad * 2.4, yy, MUTED, small) end
+        end
+      end })
+    end
+  end
+  if #items == 0 then
+    table.insert(items, { h = medium + pad, draw = function(y) text("No visits in this range", pad * 1.4, y + 6, MUTED, medium) end })
+  end
+  scrollList("log", pad, listTop, W - pad * 2 - 8, bottom, items)
+end
+
+-- ---------------------------------------------------------------- stats page
+
+local function drawStatsPage(top, bottom, pad, small, medium, big)
+  local items = {}
+  local today = dayStart(now())
+  local perDay = {}
+  local hours = {}
+  for h = 0, 23 do hours[h] = 0 end
+  local week, todayN = 0, 0
+  for _, v in ipairs(visits) do
+    local d = math.floor((today - dayStart(v.first)) / 86400)
+    if d >= 0 and d < 7 then
+      perDay[d] = (perDay[d] or 0) + 1
+      week = week + 1
+    end
+    if d == 0 then todayN = todayN + 1 end
+    local hr = tonumber(os.date("!%H", math.floor(v.first + UTC_OFFSET * 3600)))
+    if hr then hours[hr] = hours[hr] + 1 end
+  end
+
+  -- KPI cards
+  local cardH = small + big + 18
+  table.insert(items, { h = cardH + pad, draw = function(y)
+    local cw = (W - pad * 2 - 8 - pad * 2) / 3
+    local cards = { { "Today", todayN, AMBER }, { "7 days", week, { 84, 156, 240 } }, { "All time", #visits, GREEN } }
+    for i, c in ipairs(cards) do
+      local cx = pad + (i - 1) * (cw + pad)
+      rect(cx, y, cw, cardH, PANEL)
+      rect(cx, y, cw, 3, c[3])
+      text(c[1], cx + 10, y + 8, MUTED, small)
+      text(tostring(c[2]), cx + 10, y + 10 + small, WHITE, big, "bold")
+    end
+  end })
+
+  -- visits per day, last 7 days
+  local chartH = 110
+  table.insert(items, sectionItem("VISITS PER DAY", MUTED, small, pad))
+  table.insert(items, { h = chartH + small + pad, draw = function(y)
+    local maxV = 1
+    for d = 0, 6 do maxV = math.max(maxV, perDay[d] or 0) end
+    local cw = (W - pad * 2 - 8) / 7
+    for i = 0, 6 do
+      local d = 6 - i
+      local n = perDay[d] or 0
+      local bh = (chartH - small - 6) * n / maxV
+      local bx = pad + i * cw + cw * 0.18
+      rect(bx, y + chartH - small - bh, cw * 0.64, math.max(1, bh), d == 0 and AMBER or { 84, 156, 240 })
+      if n > 0 then
+        local nw = textWidth(tostring(n), small * 0.85, "bold")
+        text(tostring(n), bx + cw * 0.32 - nw / 2, y + chartH - small - bh - small, WHITE, small * 0.85, "bold")
+      end
+      local lbl = (d == 0) and "Tdy" or os.date("!%a", math.floor(today - d * 86400 + UTC_OFFSET * 3600 + 43200)):sub(1, 3)
+      local lw = textWidth(lbl, small * 0.85)
+      text(lbl, bx + cw * 0.32 - lw / 2, y + chartH - small + 4, MUTED, small * 0.85)
+    end
+  end })
+
+  -- top visitors
+  local people = {}
+  for _, st in pairs(stats) do table.insert(people, st) end
+  table.sort(people, function(a, b)
+    if a.visits ~= b.visits then return a.visits > b.visits end
+    return (a.last or 0) > (b.last or 0)
+  end)
+  table.insert(items, sectionItem("TOP VISITORS", MUTED, small, pad))
+  if #people == 0 then
+    table.insert(items, { h = small + pad, draw = function(y) text("nobody yet", pad * 1.4, y + 4, MUTED, small) end })
+  end
+  local maxVisits = people[1] and people[1].visits or 1
+  for i = 1, math.min(10, #people) do
+    local st = people[i]
+    table.insert(items, { h = small + 16, draw = function(y)
+      local barW = (W - pad * 2 - 8) * 0.5 * st.visits / maxVisits
+      text(fit(st.name, W * 0.3, small, "bold"), pad * 1.4, y + 4, WHITE, small, "bold")
+      rect(pad + W * 0.32, y + 4, math.max(2, barW), small, { 236, 74, 66 })
+      textRight(st.visits .. "x  " .. fmtDuration(st.seconds), W - pad * 2 - 8, y + 4, MUTED, small)
+    end })
+  end
+
+  -- busiest hours
+  table.insert(items, sectionItem("BUSIEST HOURS", MUTED, small, pad))
+  table.insert(items, { h = 80 + small + pad, draw = function(y)
+    local maxH = 1
+    for h = 0, 23 do maxH = math.max(maxH, hours[h]) end
+    local cw = (W - pad * 2 - 8) / 24
+    for h = 0, 23 do
+      local bh = 70 * hours[h] / maxH
+      rect(pad + h * cw + 1, y + 72 - bh, cw - 2, math.max(1, bh), { 155, 89, 182 })
+      if h % 6 == 0 then text(string.format("%02d", h), pad + h * cw, y + 76, MUTED, small * 0.85) end
+    end
+  end })
+
+  scrollList("stats", pad, top, W - pad * 2 - 8, bottom, items)
+end
+
+-- ---------------------------------------------------------------- the frame
+
+function drawGpu()
+  gpuButtons = {}
+  local pad = math.max(8, math.floor(W * 0.03))
+  local small = math.max(10, math.floor(W * 0.03))
+  local medium = math.max(12, math.floor(W * 0.04))
+  local big = math.max(16, math.floor(W * 0.06))
+  local intruders = intruderCount()
+
+  gpu.clear(display, BG[1], BG[2], BG[3])
+
+  -- Header
+  local headH = big + pad * 2
+  rect(0, 0, W, headH, PANEL)
+  text(TITLE, pad, pad - 1, WHITE, big, "bold")
+  textRight(clockText(), W - pad, (headH - medium) / 2, WHITE, medium, "bold")
+
+  -- Navigation tabs
+  local navY, navH = headH, medium + pad
+  rect(0, navY, W, navH, { 20, 23, 29 })
+  local tw = W / #PAGES
+  for i, p in ipairs(PAGES) do
+    local tx = (i - 1) * tw
+    local on = page == p[1]
+    if not on and hovered(tx, navY, tw, navH) then rect(tx, navY, tw, navH, { 32, 37, 46 }) end
+    local label = p[2]
+    if p[1] == "people" and intruders > 0 then label = label .. " (" .. intruders .. ")" end
+    local lw = textWidth(label, small, "bold")
+    text(label, tx + (tw - lw) / 2, navY + (navH - small) / 2 - 1, on and WHITE or MUTED, small, "bold")
+    if on then rect(tx + tw * 0.2, navY + navH - 3, tw * 0.6, 3, { 84, 156, 240 }) end
+    local key = p[1]
+    gpuButton(tx, navY, tw, navH, function() page = key end)
+  end
+
+  -- Status bar
+  local y = navY + navH + pad / 2
+  local barH = medium + pad
+  local enemies = {}
+  for _, name in pairs(watchedOnline) do table.insert(enemies, name) end
+  table.sort(enemies)
+  local statusW = #enemies > 0 and (W - pad * 2) * 0.55 or (W - pad * 2)
+  if scanError then
+    rect(pad, y, W - pad * 2, barH, AMBER)
+    text(fit(scanError, W - pad * 4, small, "bold"), pad * 2, y + (barH - small) / 2 - 1, BG, small, "bold")
+  else
+    local msg, bg, fg
+    if intruders > 0 then
+      bg = (math.floor(now() * 2) % 2 == 0) and RED or DARKRED
+      msg, fg = (intruders == 1 and "INTRUDER ALERT" or (intruders .. " INTRUDERS")) .. (muted() and " (MUTED)" or ""), WHITE
+    else
+      bg, msg, fg = { 22, 70, 44 }, "SECURE", GREEN
+    end
+    rect(pad, y, statusW, barH, bg)
+    local mw = textWidth(msg, medium, "bold")
+    text(fit(msg, statusW - pad, medium, "bold"), pad + math.max(pad / 2, (statusW - mw) / 2), y + (barH - medium) / 2 - 1, fg, medium, "bold")
+    if #enemies > 0 then
+      local ex = pad + statusW + pad / 2
+      local ew = W - pad - ex
+      rect(ex, y, ew, barH, AMBER)
+      text(fit("ENEMY: " .. table.concat(enemies, ", "), ew - pad, small, "bold"), ex + pad / 2, y + (barH - small) / 2 - 1, BG, small, "bold")
+    end
+  end
+  y = y + barH + pad / 2
 
   -- Footer: latest event
+  local footH = small + pad
   local fy = H - footH
+  local bottom = fy - pad / 2
+
+  if page == "people" then drawPeoplePage(y, bottom, pad, small, medium)
+  elseif page == "log" then drawLogPageNew(y, bottom, pad, small, medium)
+  elseif page == "stats" then drawStatsPage(y, bottom, pad, small, medium, big)
+  else drawRadarPage(y, bottom, pad, small, medium) end
+
   rect(0, fy, W, footH, PANEL)
   local ev = log[1]
   if ev then
-    text(fit(os.date("!%H:%M", math.floor(ev.t + UTC_OFFSET * 3600)) .. "  " .. ev.text, W - pad * 2, small), pad, fy + (footH - small) / 2 - 1, ev.kind == "alert" and RED or MUTED, small, ev.kind == "alert" and "bold" or "plain")
+    text(fit(timeOfDay(ev.t) .. "  " .. ev.text, W - pad * 2, small), pad, fy + (footH - small) / 2 - 1, ev.kind == "alert" and RED or MUTED, small, ev.kind == "alert" and "bold" or "plain")
   else
-    text("Tap a player for details", pad, fy + (footH - small) / 2 - 1, MUTED, small)
+    text("Scroll with the mouse wheel or drag; tap anything for details", pad, fy + (footH - small) / 2 - 1, MUTED, small)
   end
 
   gpu.updateDisplay(display)
+end
 end
 
 -- ============================================================ plain monitor fallback
@@ -1479,6 +1968,7 @@ local function drawStatusTab(y)
   dot(27, y, speaker ~= nil, "Speaker", speaker and "ok" or "none")
   y = y + 1
   dot(2, y, DISCORD_WEBHOOK ~= nil and discordError == nil, "Discord", DISCORD_WEBHOOK and (discordError and "error" or "on") or "off")
+  dot(27, y, botEnabled() and botState.status == nil, "Bot", botEnabled() and (botState.status and "error" or (DISCORD_PREFIX .. "commands on")) or "off")
   y = y + 1
   dot(2, y, detectorPos ~= nil, "Direction", detectorPos and "calibrated" or "not calibrated")
   if #radars > 0 then
@@ -1506,6 +1996,10 @@ local function drawStatusTab(y)
   end
   if DISCORD_WEBHOOK and discordError then
     put(2, y, ("Discord: " .. discordError):sub(1, TW - 2), colors.orange)
+    y = y + 1
+  end
+  if botEnabled() and botState.status then
+    put(2, y, ("Bot: " .. botState.status):sub(1, TW - 2), colors.orange)
     y = y + 1
   end
 
@@ -1677,7 +2171,7 @@ local function displayLoop()
   local retryAt = now() + 10
   local failures = 0
   while true do
-    if view == "log" and now() - viewAt > 30 then view = "radar" end
+    if page ~= "radar" and now() - lastInput > 60 then page = "radar" end
     if useGpu then
       local okD, errD = pcall(drawGpu)
       if okD then
@@ -1736,22 +2230,63 @@ local function tap(px, py)
   end
 end
 
+local pendingTap = nil   -- { x, y, t } waiting to see if it turns into a drag
+local drag = nil         -- { y, scroll, page } while dragging a list
+
+local function scrollBy(dy)
+  if scroll[page] then scroll[page] = scroll[page] + dy end
+end
+
+local function handleGpuEvent(e)
+  if type(e) ~= "table" then return end
+  if e.type == "mouse_hover" then
+    hover.x, hover.y, hover.at = e.x, e.y, now()
+    return
+  end
+  lastInput = now()
+  hover.x, hover.y, hover.at = e.x, e.y, now()
+  if e.type == "mouse_click" then
+    pendingTap = { x = e.x, y = e.y, t = now() }
+    drag = { y = e.y, scroll = scroll[page] or 0, page = page, t = now() }
+  elseif e.type == "mouse_drag" then
+    if drag and drag.page == page and scroll[page] then
+      local dy = e.y - drag.y
+      if math.abs(dy) > 6 then pendingTap = nil end
+      scroll[page] = drag.scroll - dy
+    end
+  elseif e.type == "mouse_scroll" then
+    local delta = tonumber(e.button) or 0
+    scrollBy(-delta * 48)
+  end
+end
+
 local function touchLoop()
   while true do
-    local timer = os.startTimer(0.2)
+    local timer = os.startTimer(0.05)
     local ev = { os.pullEvent() }
     if ev[1] == "monitor_touch" and useGpu and W then
       local ok, mw, mh = pcall(peripheral.call, ev[2], "getSize")
-      if ok and mw then tap((ev[3] - 0.5) / mw * W, (ev[4] - 0.5) / mh * H) end
+      if ok and mw then
+        lastInput = now()
+        tap((ev[3] - 0.5) / mw * W, (ev[4] - 0.5) / mh * H)
+      end
     end
     if useGpu and gpu and display then
       local ok, has = pcall(gpu.hasEvents, display)
-      while ok and has do
-        local e = gpu.pollEvent(display)
-        if e and e.type == "mouse_click" then tap(e.x, e.y) end
+      local guard = 0
+      while ok and has and guard < 200 do
+        guard = guard + 1
+        handleGpuEvent(gpu.pollEvent(display))
         ok, has = pcall(gpu.hasEvents, display)
       end
     end
+    -- a press that didn't turn into a drag is a tap
+    if pendingTap and now() - pendingTap.t > 0.2 then
+      local t = pendingTap
+      pendingTap = nil
+      tap(t.x, t.y)
+    end
+    if drag and now() - drag.t > 3 then drag = nil end
     if ev[1] ~= "timer" or ev[2] ~= timer then os.cancelTimer(timer) end
   end
 end
@@ -1761,6 +2296,9 @@ local function readyToUpdate()
 end
 
 -- ============================================================ auto-update
+-- In a block so its helpers stay out of the top-level local count.
+local updateLoop
+do
 
 -- Every UPDATE_CHECK_MINUTES this checks GitHub for a newer version. A new
 -- version is downloaded, checked that it loads, given your current settings
@@ -1893,12 +2431,13 @@ local function checkForUpdate()
   os.reboot()
 end
 
-local function updateLoop()
+function updateLoop()
   sleep(10)
   while true do
     pcall(checkForUpdate)
     sleep(UPDATE_CHECK_MINUTES * 60)
   end
 end
+end
 
-parallel.waitForAny(scanLoop, chatLoop, discordLoop, eventLoop, watchLoop, displayLoop, terminalLoop, touchLoop, updateLoop)
+parallel.waitForAny(scanLoop, chatLoop, discordLoop, botLoop, eventLoop, watchLoop, displayLoop, terminalLoop, touchLoop, updateLoop)
