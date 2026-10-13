@@ -348,8 +348,8 @@ end
 
 local function isShip(cat) return cat == "SABLE" or cat == "CONTRAPTION" end
 
-local SHIP_COLOR = { 70, 215, 255 }      -- Sable ships
-local CONTRAPTION_COLOR = { 200, 140, 255 }  -- Create contraptions and trains
+local SHIP_COLOR = { 70, 230, 255 }      -- Sable ships
+local CONTRAPTION_COLOR = { 255, 110, 230 }  -- Create contraptions and trains
 
 local function prettyType(id)
   if not id or id == "" then return "Unknown" end
@@ -1087,18 +1087,22 @@ local function hovered(x, y, w, h)
   return now() - hover.at < 1.5 and hover.x >= x and hover.x <= x + w and hover.y >= y and hover.y <= y + h
 end
 
-local FONT = "SansSerif"
-local BG = { 12, 14, 18 }
-local PANEL = { 24, 28, 35 }
-local GRID = { 30, 70, 52 }
-local GRID2 = { 22, 48, 38 }
-local SWEEP = { 70, 230, 150 }
-local MUTED = { 135, 144, 158 }
-local WHITE = { 236, 239, 244 }
-local GREEN = { 62, 200, 110 }
-local RED = { 236, 74, 66 }
-local DARKRED = { 120, 28, 26 }
-local AMBER = { 240, 172, 52 }
+-- Phosphor screen: green on near-black, amber for warnings, red for alarms.
+local FONT = "Monospaced"
+local BG = { 3, 9, 5 }
+local PANEL = { 7, 18, 10 }       -- faint fill
+local LINE = { 22, 64, 34 }       -- frames and dividers
+local GRID = { 34, 104, 56 }
+local GRID2 = { 15, 44, 24 }
+local SWEEP = { 140, 255, 160 }
+local MUTED = { 64, 160, 92 }     -- dim phosphor
+local WHITE = { 180, 255, 196 }   -- bright phosphor, main text
+local GREEN = { 90, 255, 120 }
+local RED = { 255, 64, 44 }
+local DARKRED = { 96, 18, 12 }
+local AMBER = { 255, 176, 32 }
+local HOVER = { 12, 38, 20 }
+local SCOPE = { 4, 16, 8 }        -- radar background
 
 local function I(v) return math.floor(v + 0.5) end
 local function rect(x, y, w, h, c)
@@ -1183,20 +1187,30 @@ local function drawRadar(cx, cy, r, small)
   radarHits = {}
   -- Everything except players shrinks as you zoom out and grows as you zoom in.
   local iconScale = math.max(0.35, math.min(1.6, 64 / zoom))
-  circle(cx, cy, r, { 10, 22, 17 }, true)
+  circle(cx, cy, r, SCOPE, true)
   for i = 1, 4 do
     circle(cx, cy, r * i / 4, (i == 4) and GRID or GRID2, false)
   end
+  circle(cx, cy, r - 1, GRID, false)
   line(cx - r, cy, cx + r, cy, GRID2)
   line(cx, cy - r, cx, cy + r, GRID2)
+  -- bearing scale: a tick every 10 degrees, longer every 30
+  for deg = 0, 350, 10 do
+    local a = math.rad(deg)
+    local len = (deg % 30 == 0) and 9 or 4
+    line(cx + math.cos(a) * (r - len), cy + math.sin(a) * (r - len), cx + math.cos(a) * r, cy + math.sin(a) * r, GRID)
+  end
+  -- centre crosshair
+  line(cx - 7, cy, cx + 7, cy, GRID)
+  line(cx, cy - 7, cx, cy + 7, GRID)
   if detectorPos then
     -- compass letters just inside the rim, turned with the radar
     for _, d in ipairs({ { "N", 0, -1 }, { "E", 1, 0 }, { "S", 0, 1 }, { "W", -1, 0 } }) do
       local a = screenAngle(d[2], d[3])
       local lw = textWidth(d[1], small, "bold")
-      local lx = cx + math.cos(a) * (r - small) - lw / 2
-      local ly = cy + math.sin(a) * (r - small) - small / 2
-      text(d[1], lx, ly, d[1] == "N" and { 200, 70, 60 } or GRID, small, "bold")
+      local lx = cx + math.cos(a) * (r - small - 8) - lw / 2
+      local ly = cy + math.sin(a) * (r - small - 8) - small / 2
+      text(d[1], lx, ly, d[1] == "N" and AMBER or GRID, small, "bold")
     end
   end
 
@@ -1204,7 +1218,7 @@ local function drawRadar(cx, cy, r, small)
   local a0 = (now() * 1.6) % (2 * math.pi)
   for k = 14, 0, -1 do
     local a = a0 - k * 0.045
-    local c = mix({ 10, 22, 17 }, SWEEP, (1 - k / 15) ^ 2)
+    local c = mix(SCOPE, SWEEP, (1 - k / 15) ^ 2)
     line(cx, cy, cx + math.cos(a) * r, cy + math.sin(a) * r, c)
   end
 
@@ -1212,7 +1226,7 @@ local function drawRadar(cx, cy, r, small)
   local SHIP = { 90, 160, 245 }
   local HOST = { 245, 120, 50 }
   local PROJ = { 250, 220, 70 }
-  local MOBC = { 120, 128, 140 }
+  local MOBC = { 70, 130, 90 }
   local UNKNOWN = { 240, 172, 52 }
   for _, t in ipairs(visibleTracks()) do
     if t.dist and t.dx then
@@ -1277,7 +1291,7 @@ local function drawRadar(cx, cy, r, small)
         local k = math.min(r, 5 * t.speed / zoom * (r - 6))
         for i = 1, 6 do
           local wx, wy = pt((-8 - i * 4) * scale / 1.3, 0)
-          circle(wx, wy, math.max(1, (3 - i * 0.4) * scale / 1.3), mix({ 10, 22, 17 }, SHIPC, 0.6 - i * 0.08), true)
+          circle(wx, wy, math.max(1, (3 - i * 0.4) * scale / 1.3), mix(SCOPE, SHIPC, 0.6 - i * 0.08), true)
         end
         for i = 0, 7 do
           local f0, f1 = 12 * scale / 1.3 + k * i / 8, 12 * scale / 1.3 + k * (i + 0.5) / 8
@@ -1364,9 +1378,37 @@ local function drawRadar(cx, cy, r, small)
   circle(cx, cy, 3, WHITE, true)
 end
 
+local function frame(x, y, w, h, c)
+  rect(x, y, w, 1, c)
+  rect(x, y + h - 1, w, 1, c)
+  rect(x, y, 1, h, c)
+  rect(x + w - 1, y, 1, h, c)
+end
+
+-- Corner brackets, like a targeting box.
+local function brackets(x, y, w, h, c, len)
+  len = len or 8
+  rect(x, y, len, 2, c) rect(x, y, 2, len, c)
+  rect(x + w - len, y, len, 2, c) rect(x + w - 2, y, 2, len, c)
+  rect(x, y + h - 2, len, 2, c) rect(x, y + h - len, 2, len, c)
+  rect(x + w - len, y + h - 2, len, 2, c) rect(x + w - 2, y + h - len, 2, len, c)
+end
+
+-- Buttons are outlined; "on" buttons (ON, AMBER, RED) and hovered ones are
+-- filled solid with dark text, like an inverted terminal cell.
+local ON = { 90, 255, 120 }
 local function pill(x, y, w, h, label, bg, fg, size, action)
-  if action and hovered(x, y, w, h) then bg = mix(bg, { 255, 255, 255 }, 0.15) end
-  rect(x, y, w, h, bg)
+  local solid = bg == ON or bg == AMBER or bg == RED
+  if solid then
+    rect(x, y, w, h, bg)
+    fg = BG
+  elseif action and hovered(x, y, w, h) then
+    rect(x, y, w, h, MUTED)
+    fg = BG
+  else
+    frame(x, y, w, h, action and MUTED or LINE)
+    if not action then fg = MUTED end
+  end
   local lw = textWidth(label, size, "bold")
   text(label, x + (w - lw) / 2, y + (h - size) / 2 - 1, fg, size, "bold")
   if action then gpuButton(x, y, w, h, action) end
@@ -1444,10 +1486,11 @@ local function drawDetails(e, x, bottom, w, small, medium)
   local rowH = small + 5
   local h = medium + 12 + #lines * rowH + 4
   local y = bottom - h
-  rect(x, y, w, h, PANEL)
-  rect(x, y, 4, h, color)
-  text(fit(title, w - 44, medium, "bold"), x + 12, y + 6, WHITE, medium, "bold")
-  pill(x + w - 30, y + 4, 26, medium + 4, "X", { 50, 56, 66 }, WHITE, small, function() selected = nil end)
+  rect(x, y, w, h, BG)
+  frame(x, y, w, h, LINE)
+  brackets(x, y, w, h, color, 10)
+  text(fit(title:upper(), w - 44, medium, "bold"), x + 12, y + 6, color, medium, "bold")
+  pill(x + w - 30, y + 5, 24, medium + 2, "X", nil, WHITE, small, function() selected = nil end)
   for i, l in ipairs(lines) do
     text(fit(l, w - 20, small), x + 12, y + medium + 12 + (i - 1) * rowH, MUTED, small)
   end
@@ -1492,7 +1535,7 @@ local function scrollList(name, x, top, w, bottom, items)
   local y = top - scroll[name]
   for _, it in ipairs(items) do
     if y >= top - 0.5 and y + it.h <= bottom + 0.5 then
-      if it.onTap and hovered(x, y, w, it.h) then rect(x, y, w, it.h, { 30, 35, 44 }) end
+      if it.onTap and hovered(x, y, w, it.h) then rect(x, y, w, it.h, HOVER) end
       it.draw(y)
       if it.onTap then gpuButton(x, y, w, it.h, it.onTap) end
     end
@@ -1500,13 +1543,13 @@ local function scrollList(name, x, top, w, bottom, items)
   end
   if maxScroll > 0 then
     local trackX = x + w + 3
-    rect(trackX, top, 4, viewH, { 34, 38, 46 })
+    rect(trackX + 1, top, 2, viewH, LINE)
     local thumbH = math.max(24, viewH * viewH / total)
     local thumbY = top + (viewH - thumbH) * scroll[name] / maxScroll
-    rect(trackX, thumbY, 4, thumbH, { 120, 128, 140 })
+    rect(trackX, thumbY, 4, thumbH, MUTED)
     -- small arrow when there's more above
     if scroll[name] > 0 then
-      for i = 0, 3 do rect(trackX + 2 - i, top - 6 + i, 1 + i * 2, 1, { 120, 128, 140 }) end
+      for i = 0, 3 do rect(trackX + 2 - i, top - 6 + i, 1 + i * 2, 1, MUTED) end
     end
   end
   return maxScroll
@@ -1519,13 +1562,13 @@ local function drawRadarPage(top, bottom, pad, small, medium)
   local tbH = small + pad
   local bw = math.floor((W - pad * 2 - pad * 3) / 4)
   local x = pad
-  local BTN = { 50, 56, 66 }
+  local BTN = nil
   pill(x, y, bw, tbH, "-", BTN, WHITE, medium, function() zoomStep(-1) end)
   x = x + bw + pad
   pill(x, y, bw, tbH, "+", BTN, WHITE, medium, function() zoomStep(1) end)
   x = x + bw + pad
   local m = currentMode()
-  pill(x, y, bw, tbH, m:upper(), #radars > 0 and { 40, 70, 110 } or { 40, 44, 52 }, #radars > 0 and WHITE or MUTED, small * 0.85, function()
+  pill(x, y, bw, tbH, m:upper(), nil, #radars > 0 and WHITE or MUTED, small * 0.85, function()
     if #radars == 0 then
       event("Add a Create Radar for THREATS and ALL modes", "info")
       return
@@ -1543,7 +1586,7 @@ local function drawRadarPage(top, bottom, pad, small, medium)
     end)
   else
     local open = unlocked()
-    pill(x, y, bw, tbH, "MUTE", open and { 120, 90, 30 } or { 40, 44, 52 }, open and WHITE or MUTED, small, function()
+    pill(x, y, bw, tbH, "MUTE", nil, open and AMBER or MUTED, small, function()
       if unlocked() then
         muteUntil = now() + MUTE_MINUTES * 60
         event("Alarm muted by " .. tostring(unlockedBy), "info")
@@ -1593,17 +1636,21 @@ local function drawRadarPage(top, bottom, pad, small, medium)
 
   local sw = textWidth(summary, small)
   local sx = (W - sw) / 2
-  if hovered(pad, y, W - pad * 2, sumH) then rect(pad, y, W - pad * 2, sumH, { 30, 35, 44 }) end
+  if hovered(pad, y, W - pad * 2, sumH) then rect(pad, y, W - pad * 2, sumH, HOVER) end
   text(fit(summary, W - pad * 2, small), math.max(pad, sx), y + (sumH - small) / 2 - 1, MUTED, small)
   gpuButton(pad, y, W - pad * 2, sumH, function() page = "people" end)
 end
 
 -- ---------------------------------------------------------------- people page
 
+-- "-- ALLOWED (2) ---------------------" style headers
 local function sectionItem(label, color, small, pad)
   return { h = small + pad + 4, draw = function(y)
-    text(label, pad * 1.4, y + pad / 2 + 2, color, small, "bold")
-    rect(pad, y + small + pad, W - pad * 2 - 8, 1, { 44, 50, 60 })
+    local ty = y + pad / 2 + 2
+    rect(pad, ty + small / 2, 10, 1, LINE)
+    text(label, pad + 16, ty, color, small, "bold")
+    local lx = pad + 22 + textWidth(label, small, "bold")
+    rect(lx, ty + small / 2, W - pad - 8 - lx, 1, LINE)
   end }
 end
 
@@ -1615,9 +1662,9 @@ local function personRowItems(items, key, title, right, color, details, pad, sma
   table.insert(items, { h = h + 4, key = key, onTap = function()
     expanded[key] = not expanded[key] or nil
   end, draw = function(y)
-    rect(pad, y, W - pad * 2 - 8, h, PANEL)
-    rect(pad, y, 4, h, color)
+    rect(pad, y + 3, 3, h - 6, color)
     text(fit(title, W * 0.48, medium, "bold"), pad * 1.8, y + 7, WHITE, medium, "bold")
+    if open then frame(pad, y, W - pad * 2 - 8, h, LINE) end
     textRight(fit(right, W * 0.42, small, "bold"), W - pad * 2 - 8, y + 9, color, small, "bold")
     if open then
       local yy = y + rowH
@@ -1627,7 +1674,7 @@ local function personRowItems(items, key, title, right, color, details, pad, sma
       end
       -- jump to it on the radar
       local bw = textWidth("SHOW ON RADAR", small * 0.85, "bold") + pad * 2
-      pill(pad * 1.8, yy + 4, bw, small + 8, "SHOW ON RADAR", { 40, 70, 110 }, WHITE, small * 0.85, function()
+      pill(pad * 1.8, yy + 4, bw, small + 8, "SHOW ON RADAR", nil, WHITE, small * 0.85, function()
         selected = key
         page = "radar"
       end)
@@ -1693,7 +1740,7 @@ local function drawLogPageNew(top, bottom, pad, small, medium)
   for _, c in ipairs(chips) do
     local on = logFilter == c[1]
     local cw = textWidth(c[2], small * 0.9, "bold") + pad * 2
-    pill(x, top, cw, chipH, c[2], on and { 40, 70, 110 } or { 40, 44, 52 }, on and WHITE or MUTED, small * 0.9, function()
+    pill(x, top, cw, chipH, c[2], on and ON or nil, on and WHITE or MUTED, small * 0.9, function()
       logFilter = c[1]
       scroll.log = 0
     end)
@@ -1717,7 +1764,7 @@ local function drawLogPageNew(top, bottom, pad, small, medium)
         lastDay = d
       end
       table.insert(items, { h = small + 14, draw = function(y)
-        if i % 2 == 0 then rect(pad, y, W - pad * 2 - 8, small + 12, { 20, 23, 29 }) end
+        if i % 2 == 0 then rect(pad, y, W - pad * 2 - 8, small + 12, PANEL) end
         text(timeOfDay(e.t), pad * 1.4, y + 6, MUTED, small)
         text(fit(e.name, W * 0.36, small, "bold"), pad * 1.4 + textWidth("00:00  ", small), y + 6, WHITE, small, "bold")
         if e.kind == "join" then
@@ -1729,7 +1776,7 @@ local function drawLogPageNew(top, bottom, pad, small, medium)
     end
     for _, sess in pairs(enemy.sessions) do
       table.insert(items, 1, { h = small + 14, draw = function(y)
-        rect(pad, y, W - pad * 2 - 8, small + 12, { 70, 30, 30 })
+        rect(pad, y, W - pad * 2 - 8, small + 12, DARKRED)
         text(fit(sess.name .. " ONLINE NOW", W * 0.6, small, "bold"), pad * 1.4, y + 6, WHITE, small, "bold")
         textRight("for " .. fmtDuration(now() - sess.since), W - pad * 2 - 8, y + 6, AMBER, small, "bold")
       end })
@@ -1754,7 +1801,7 @@ local function drawLogPageNew(top, bottom, pad, small, medium)
       local lineH = small + 5
       local h = rowH + (open and (3 * lineH + 6) or 0)
       table.insert(items, { h = h + 2, onTap = function() expanded[key] = not expanded[key] or nil end, draw = function(y)
-        if i % 2 == 0 then rect(pad, y, W - pad * 2 - 8, h, { 20, 23, 29 }) end
+        if i % 2 == 0 then rect(pad, y, W - pad * 2 - 8, h, PANEL) end
         text(timeOfDay(v.first), pad * 1.4, y + 6, MUTED, small)
         text(fit(v.name, W * 0.36, small, "bold"), pad * 1.4 + textWidth("00:00  ", small), y + 6, WHITE, small, "bold")
         textRight(fmtDuration(v.last - v.first) .. "   " .. meters(v.closest), W - pad * 2 - 8, y + 6, AMBER, small)
@@ -1798,13 +1845,13 @@ local function drawStatsPage(top, bottom, pad, small, medium, big)
   local cardH = small + big + 18
   table.insert(items, { h = cardH + pad, draw = function(y)
     local cw = (W - pad * 2 - 8 - pad * 2) / 3
-    local cards = { { "Today", todayN, AMBER }, { "7 days", week, { 84, 156, 240 } }, { "All time", #visits, GREEN } }
+    local cards = { { "TODAY", todayN, AMBER }, { "7 DAYS", week, GREEN }, { "ALL TIME", #visits, WHITE } }
     for i, c in ipairs(cards) do
       local cx = pad + (i - 1) * (cw + pad)
-      rect(cx, y, cw, cardH, PANEL)
-      rect(cx, y, cw, 3, c[3])
+      frame(cx, y, cw, cardH, LINE)
+      brackets(cx, y, cw, cardH, c[3], 6)
       text(c[1], cx + 10, y + 8, MUTED, small)
-      text(tostring(c[2]), cx + 10, y + 10 + small, WHITE, big, "bold")
+      text(tostring(c[2]), cx + 10, y + 10 + small, c[3], big, "bold")
     end
   end })
 
@@ -1820,7 +1867,7 @@ local function drawStatsPage(top, bottom, pad, small, medium, big)
       local n = perDay[d] or 0
       local bh = (chartH - small - 6) * n / maxV
       local bx = pad + i * cw + cw * 0.18
-      rect(bx, y + chartH - small - bh, cw * 0.64, math.max(1, bh), d == 0 and AMBER or { 84, 156, 240 })
+      rect(bx, y + chartH - small - bh, cw * 0.64, math.max(1, bh), d == 0 and AMBER or GREEN)
       if n > 0 then
         local nw = textWidth(tostring(n), small * 0.85, "bold")
         text(tostring(n), bx + cw * 0.32 - nw / 2, y + chartH - small - bh - small, WHITE, small * 0.85, "bold")
@@ -1848,7 +1895,7 @@ local function drawStatsPage(top, bottom, pad, small, medium, big)
     table.insert(items, { h = small + 16, draw = function(y)
       local barW = (W - pad * 2 - 8) * 0.5 * st.visits / maxVisits
       text(fit(st.name, W * 0.3, small, "bold"), pad * 1.4, y + 4, WHITE, small, "bold")
-      rect(pad + W * 0.32, y + 4, math.max(2, barW), small, { 236, 74, 66 })
+      rect(pad + W * 0.32, y + 4, math.max(2, barW), small, RED)
       textRight(st.visits .. "x  " .. fmtDuration(st.seconds), W - pad * 2 - 8, y + 4, MUTED, small)
     end })
   end
@@ -1861,7 +1908,7 @@ local function drawStatsPage(top, bottom, pad, small, medium, big)
     local cw = (W - pad * 2 - 8) / 24
     for h = 0, 23 do
       local bh = 70 * hours[h] / maxH
-      rect(pad + h * cw + 1, y + 72 - bh, cw - 2, math.max(1, bh), { 155, 89, 182 })
+      rect(pad + h * cw + 1, y + 72 - bh, cw - 2, math.max(1, bh), MUTED)
       if h % 6 == 0 then text(string.format("%02d", h), pad + h * cw, y + 76, MUTED, small * 0.85) end
     end
   end })
@@ -1883,23 +1930,26 @@ function drawGpu()
 
   -- Header
   local headH = big + pad * 2
-  rect(0, 0, W, headH, PANEL)
-  text(TITLE, pad, pad - 1, WHITE, big, "bold")
-  textRight(clockText(), W - pad, (headH - medium) / 2, WHITE, medium, "bold")
+  text(TITLE:upper(), pad, pad - 1, WHITE, big, "bold")
+  textRight(os.date("!%H:%M:%S", math.floor(now() + UTC_OFFSET * 3600)), W - pad, pad - 1, GREEN, medium, "bold")
+  textRight("DET " .. RANGE .. "M  RDR " .. (#radars > 0 and "ON" or "--"), W - pad, pad + medium + 1, MUTED, small * 0.85)
+  rect(pad, headH - 4, W - pad * 2, 1, LINE)
 
   -- Navigation tabs
   local navY, navH = headH, medium + pad
-  rect(0, navY, W, navH, { 20, 23, 29 })
-  local tw = W / #PAGES
+  local tw = (W - pad * 2) / #PAGES
   for i, p in ipairs(PAGES) do
-    local tx = (i - 1) * tw
+    local tx = pad + (i - 1) * tw
     local on = page == p[1]
-    if not on and hovered(tx, navY, tw, navH) then rect(tx, navY, tw, navH, { 32, 37, 46 }) end
     local label = p[2]
-    if p[1] == "people" and intruders > 0 then label = label .. " (" .. intruders .. ")" end
+    if p[1] == "people" and intruders > 0 then label = label .. "(" .. intruders .. ")" end
+    if on then
+      rect(tx + 2, navY + 3, tw - 4, navH - 6, GREEN)
+    elseif hovered(tx, navY, tw, navH) then
+      rect(tx + 2, navY + 3, tw - 4, navH - 6, HOVER)
+    end
     local lw = textWidth(label, small, "bold")
-    text(label, tx + (tw - lw) / 2, navY + (navH - small) / 2 - 1, on and WHITE or MUTED, small, "bold")
-    if on then rect(tx + tw * 0.2, navY + navH - 3, tw * 0.6, 3, { 84, 156, 240 }) end
+    text(label, tx + (tw - lw) / 2, navY + (navH - small) / 2 - 1, on and BG or MUTED, small, "bold")
     local key = p[1]
     gpuButton(tx, navY, tw, navH, function() page = key end)
   end
@@ -1913,23 +1963,27 @@ function drawGpu()
   local statusW = #enemies > 0 and (W - pad * 2) * 0.55 or (W - pad * 2)
   if scanError then
     rect(pad, y, W - pad * 2, barH, AMBER)
-    text(fit(scanError, W - pad * 4, small, "bold"), pad * 2, y + (barH - small) / 2 - 1, BG, small, "bold")
+    text(fit("FAULT: " .. scanError:upper(), W - pad * 4, small, "bold"), pad * 2, y + (barH - small) / 2 - 1, BG, small, "bold")
   else
     local msg, bg, fg
     if intruders > 0 then
-      bg = (math.floor(now() * 2) % 2 == 0) and RED or DARKRED
-      msg, fg = (intruders == 1 and "INTRUDER ALERT" or (intruders .. " INTRUDERS")) .. (muted() and " (MUTED)" or ""), WHITE
+      local blink = math.floor(now() * 2) % 2 == 0
+      bg = blink and RED or DARKRED
+      msg = "!! " .. (intruders == 1 and "INTRUDER" or (intruders .. " INTRUDERS")) .. (muted() and " / MUTED" or "") .. " !!"
+      fg = blink and BG or RED
+      rect(pad, y, statusW, barH, bg)
     else
-      bg, msg, fg = { 22, 70, 44 }, "SECURE", GREEN
+      bg, msg, fg = nil, "STATUS: SECURE", GREEN
+      frame(pad, y, statusW, barH, LINE)
+      brackets(pad, y, statusW, barH, GREEN, 8)
     end
-    rect(pad, y, statusW, barH, bg)
     local mw = textWidth(msg, medium, "bold")
     text(fit(msg, statusW - pad, medium, "bold"), pad + math.max(pad / 2, (statusW - mw) / 2), y + (barH - medium) / 2 - 1, fg, medium, "bold")
     if #enemies > 0 then
       local ex = pad + statusW + pad / 2
       local ew = W - pad - ex
       rect(ex, y, ew, barH, AMBER)
-      text(fit("ENEMY: " .. table.concat(enemies, ", "), ew - pad, small, "bold"), ex + pad / 2, y + (barH - small) / 2 - 1, BG, small, "bold")
+      text(fit("HOSTILE ONLINE: " .. table.concat(enemies, ", "):upper(), ew - pad, small, "bold"), ex + pad / 2, y + (barH - small) / 2 - 1, BG, small, "bold")
     end
   end
   y = y + barH + pad / 2
@@ -1944,12 +1998,13 @@ function drawGpu()
   elseif page == "stats" then drawStatsPage(y, bottom, pad, small, medium, big)
   else drawRadarPage(y, bottom, pad, small, medium) end
 
-  rect(0, fy, W, footH, PANEL)
+  rect(pad, fy, W - pad * 2, 1, LINE)
   local ev = log[1]
+  local cursor = (math.floor(now() * 2) % 2 == 0) and "_" or " "
   if ev then
-    text(fit(timeOfDay(ev.t) .. "  " .. ev.text, W - pad * 2, small), pad, fy + (footH - small) / 2 - 1, ev.kind == "alert" and RED or MUTED, small, ev.kind == "alert" and "bold" or "plain")
+    text(fit("> " .. timeOfDay(ev.t) .. " " .. ev.text:upper() .. cursor, W - pad * 2, small), pad, fy + (footH - small) / 2, ev.kind == "alert" and RED or MUTED, small, ev.kind == "alert" and "bold" or "plain")
   else
-    text("Scroll with the mouse wheel or drag; tap anything for details", pad, fy + (footH - small) / 2 - 1, MUTED, small)
+    text("> READY" .. cursor, pad, fy + (footH - small) / 2, MUTED, small)
   end
 
   gpu.updateDisplay(display)
