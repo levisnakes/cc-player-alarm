@@ -2378,7 +2378,7 @@ end
 
 -- ============================================================ auto-update
 -- In a block so its helpers stay out of the top-level local count.
-local updateLoop
+local updateLoop, bootUpdate
 do
 
 -- Every UPDATE_CHECK_MINUTES this checks GitHub for a newer version. A new
@@ -2481,7 +2481,7 @@ local function writeText(path, text)
   f.close()
 end
 
-local function checkForUpdate()
+local function checkForUpdate(atBoot)
   if AUTO_UPDATE == false or not http then return end
   local sha = fetch("https://api.github.com/repos/" .. UPDATE_REPO .. "/commits/main",
     { ["Accept"] = "application/vnd.github.sha", ["User-Agent"] = "cc-auto-update" })
@@ -2500,7 +2500,8 @@ local function checkForUpdate()
     return
   end
 
-  while not readyToUpdate() do sleep(5) end
+  -- at boot nothing is running yet, so there is nothing to wait for
+  while not atBoot and not readyToUpdate() do sleep(5) end
   writeText(PROGRAM_PATH .. ".old", oldSrc)
   writeText(PROGRAM_PATH, merged)
   writeText(SHA_FILE, sha)
@@ -2508,17 +2509,28 @@ local function checkForUpdate()
   term.clear()
   term.setCursorPos(1, 1)
   print("Updated to " .. sha:sub(1, 7) .. ", restarting...")
-  sleep(1)
+  if not atBoot then sleep(1) end
   os.reboot()
 end
 
 function updateLoop()
-  sleep(10)
   while true do
-    pcall(checkForUpdate)
     sleep(UPDATE_CHECK_MINUTES * 60)
+    pcall(checkForUpdate)
   end
+end
+
+-- Check for a new version as soon as the computer starts, before the
+-- program runs, so a restart always picks up the latest version.
+function bootUpdate()
+  if AUTO_UPDATE == false or not http then return end
+  term.setBackgroundColor(colors.black)
+  term.clear()
+  term.setCursorPos(1, 1)
+  print("Checking for updates...")
+  pcall(checkForUpdate, true)
 end
 end
 
+bootUpdate()
 parallel.waitForAny(scanLoop, chatLoop, discordLoop, botLoop, eventLoop, watchLoop, displayLoop, terminalLoop, touchLoop, updateLoop)
