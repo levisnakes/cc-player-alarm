@@ -10,7 +10,7 @@ ComputerCraft base security for an Advanced Peripherals Player Detector. When a 
 
 Every visit is logged with the time it started, how long it lasted and the closest the player got.
 
-Players in `WATCH_JOINS` (default: `Mechanoo`) are treated as enemies: when one comes online, every other online player gets a formatted **ENEMY DETECTED** chat message (the enemy doesn't), and an amber ENEMY ONLINE bar shows on the monitor while they're on.
+Players in `WATCH_JOINS` (default: `Mechanoo`) are treated as enemies. When one joins, the allowed players who are online get an **ENEMY DETECTED** chat message (once per session: a reboot or chunk reload while they're still on doesn't announce them again), Discord gets a post without a ping, and every join and leave is logged with how long they stayed (LOG page, ENEMY filter, and `!enemylog`). An amber ENEMY bar shows on the monitor while they're on.
 
 ## Discord
 
@@ -22,7 +22,7 @@ Alerts can also go to a Discord channel through a webhook, no bot or server need
 
 It posts intruders arriving, getting close and leaving, and enemies coming online and going offline. Keep the URL private: anyone who has it can post to that channel.
 
-To ping a role with every alert, set `DISCORD_MENTION = "<@&ROLE_ID>"`. The easiest way to get the ID: type `\@Role Name` in any Discord channel and send it; Discord shows the raw `<@&...>` form to copy.
+To ping a role when someone is at the base (intruder alerts only; enemy joins never ping), set `DISCORD_MENTION = "<@&ROLE_ID>"`. The easiest way to get the ID: type `\@Role Name` in any Discord channel and send it; Discord shows the raw `<@&...>` form to copy.
 
 ## Discord bot commands
 

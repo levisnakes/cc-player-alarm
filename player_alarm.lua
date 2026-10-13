@@ -210,9 +210,10 @@ end
 local discordQueue = {}
 local discordError = nil
 
-local function discord(title, text, color)
+-- ping = true adds DISCORD_MENTION; only used when someone is at the base.
+local function discord(title, text, color, ping)
   if not DISCORD_WEBHOOK or DISCORD_WEBHOOK == "" or not http then return end
-  table.insert(discordQueue, { title = title, text = text, color = color })
+  table.insert(discordQueue, { title = title, text = text, color = color, ping = ping })
 end
 
 local function discordLoop()
@@ -221,7 +222,7 @@ local function discordLoop()
     if msg then
       local body = textutils.serializeJSON({
         username = TITLE,
-        content = DISCORD_MENTION or "",
+        content = (msg.ping and DISCORD_MENTION) or "",
         allowed_mentions = { parse = { "roles", "users", "everyone" } },
         embeds = { {
           title = msg.title,
@@ -269,7 +270,7 @@ end
 
 local function onArrive(v)
   local where = whereText(v.name, v.dist)
-  discord("Intruder detected", "**" .. v.name .. "** is " .. where .. " from base.", RED_C)
+  discord("Intruder detected", "**" .. v.name .. "** is " .. where .. " from base.", RED_C, true)
   event(v.name .. " arrived (" .. where .. ")", "alert")
   warnAllowed("Intruder " .. v.name .. " is " .. where .. " from base", "Intruder alert")
   alertFlash = now() + 6
@@ -278,7 +279,7 @@ end
 
 local function onClose(v)
   local where = whereText(v.name, v.dist)
-  discord("Intruder getting close", "**" .. v.name .. "** is " .. where .. " from base.", RED_C)
+  discord("Intruder getting close", "**" .. v.name .. "** is " .. where .. " from base.", RED_C, true)
   event(v.name .. " is " .. where .. " away", "alert")
   warnAllowed(v.name .. " is getting close: " .. where, "Intruder close")
   alertFlash = now() + 6
@@ -587,7 +588,15 @@ local watched = {}
 for _, n in ipairs(WATCH_JOINS) do watched[n:lower()] = true end
 
 -- Watched players currently online, by lower-case name -> display name.
+-- Enemy sessions are saved, so a reboot or chunk reload while an enemy is
+-- online continues the same session instead of announcing them again.
+local enemy = {
+  sessions = readFile(DIR .. "/enemies", {}),   -- [lower name] = { name, since, seen }
+  log = readFile(DIR .. "/enemylog", {}),       -- { name, kind = "join"/"leave", t, since }
+  savedAt = 0,
+}
 local watchedOnline = {}
+for key, sess in pairs(enemy.sessions) do watchedOnline[key] = sess.name end
 
 -- Minecraft chat JSON for the enemy announcement.
 local function enemyMessage(name, test)
@@ -627,12 +636,13 @@ local function testEnemyMessage()
 end
 
 -- Everyone online except the enemy hears about it, enemy alerts first in line.
+-- In-game warning goes to the allowed list only.
 local function announceEnemy(name, online)
   if not chat then return end
   local json, plain = enemyMessage(name)
   local pos = 1
   for _, p in ipairs(online) do
-    if p:lower() ~= name:lower() then
+    if isAllowed(p) and p:lower() ~= name:lower() then
       table.insert(chatQueue, pos, { player = p, json = json, text = plain })
       pos = pos + 1
     end
@@ -646,20 +656,41 @@ local function checkWatched()
   for _, p in ipairs(online) do
     if watched[p:lower()] then now_[p:lower()] = p end
   end
+  local t = now()
+  local changed = false
   for key, name in pairs(now_) do
-    if not watchedOnline[key] then
+    local sess = enemy.sessions[key]
+    if not sess then
+      -- a new session: announce once
+      enemy.sessions[key] = { name = name, since = t, seen = t }
+      table.insert(enemy.log, { name = name, kind = "join", t = t })
       event("ENEMY " .. name .. " is online", "alert")
       announceEnemy(name, online)
-      discord("ENEMY DETECTED", "**" .. name .. "** has entered the server.", PURPLE_C)
+      discord("Enemy online", "**" .. name .. "** joined the server.", PURPLE_C)
+      changed = true
+    else
+      sess.seen = t
     end
   end
-  for key, name in pairs(watchedOnline) do
+  for key, sess in pairs(enemy.sessions) do
     if not now_[key] then
-      event(name .. " went offline", "info")
-      discord("Enemy offline", "**" .. name .. "** left the server.", AMBER_C)
+      local dur = sess.seen - sess.since
+      table.insert(enemy.log, { name = sess.name, kind = "leave", t = sess.seen, since = sess.since })
+      event(sess.name .. " went offline after " .. fmtDuration(dur), "info")
+      discord("Enemy offline", "**" .. sess.name .. "** left the server after " .. fmtDuration(dur) .. ".", AMBER_C)
+      enemy.sessions[key] = nil
+      changed = true
     end
   end
-  watchedOnline = now_
+  while #enemy.log > 300 do table.remove(enemy.log, 1) end
+  if changed then writeFile(DIR .. "/enemylog", enemy.log) end
+  -- "last seen" is saved at most once a minute so a reboot knows the session is still going
+  if changed or t - enemy.savedAt > 60 then
+    writeFile(DIR .. "/enemies", enemy.sessions)
+    enemy.savedAt = t
+  end
+  watchedOnline = {}
+  for key, sess in pairs(enemy.sessions) do watchedOnline[key] = sess.name end
 end
 
 local function watchLoop()
@@ -810,6 +841,7 @@ COMMANDS.help = function(m)
       "`" .. p .. "whoonline` who's on the server and who's near the base",
       "`" .. p .. "status` alarm status, intruders and enemies",
       "`" .. p .. "visits [n]` the last visits to the base",
+      "`" .. p .. "enemylog [n]` when enemies joined and left",
       "`" .. p .. "where <player>` how far a player is from the base",
       "`" .. p .. "say <message>` post a message in Minecraft chat",
       "`" .. p .. "mute [minutes]` / `" .. p .. "unmute` silence the alarm (admins)",
@@ -850,7 +882,7 @@ end
 COMMANDS.status = function(m)
   local n = intruderCount()
   local enemies = {}
-  for _, name in pairs(watchedOnline) do table.insert(enemies, name) end
+  for _, sess in pairs(enemy.sessions) do table.insert(enemies, sess.name .. " (since " .. fmtWhen(sess.since) .. ")") end
   local intruderNames = {}
   for name in pairs(active) do table.insert(intruderNames, name) end
   local fields = {
@@ -930,6 +962,24 @@ COMMANDS.say = function(m, args, rest)
     table.insert(chatQueue, { player = p, json = msgJson, text = displayName(m) .. ": " .. text })
   end
   reply(m, { title = E.chat .. " Sent to " .. #online .. " player" .. (#online == 1 and "" or "s"), color = 3066993, description = text })
+end
+
+COMMANDS.enemylog = function(m, args)
+  local count = math.max(1, math.min(20, tonumber(args[1]) or 10))
+  local lines = {}
+  for i = #enemy.log, math.max(1, #enemy.log - count + 1), -1 do
+    local e = enemy.log[i]
+    if e.kind == "join" then
+      table.insert(lines, "`" .. fmtWhen(e.t) .. "` " .. E.red .. " **" .. e.name .. "** joined")
+    else
+      table.insert(lines, "`" .. fmtWhen(e.t) .. "` " .. E.white .. " **" .. e.name .. "** left after " .. fmtDuration(e.t - (e.since or e.t)))
+    end
+  end
+  reply(m, {
+    title = E.swords .. " Enemy log",
+    color = 10181046,
+    description = #lines > 0 and table.concat(lines, "\n") or "no enemy joins logged yet",
+  })
 end
 
 COMMANDS.mute = function(m, args)
@@ -1620,7 +1670,7 @@ end
 
 local function drawLogPageNew(top, bottom, pad, small, medium)
   -- filter chips
-  local chips = { { "all", "ALL" }, { "today", "TODAY" }, { "week", "7 DAYS" } }
+  local chips = { { "all", "ALL" }, { "today", "TODAY" }, { "week", "7 DAYS" }, { "enemy", "ENEMY" } }
   local x = pad
   local chipH = small + 10
   for _, c in ipairs(chips) do
@@ -1632,16 +1682,47 @@ local function drawLogPageNew(top, bottom, pad, small, medium)
     end)
     x = x + cw + pad / 2
   end
-  textRight(#visits .. " visits logged", W - pad, top + (chipH - small) / 2, MUTED, small)
+  textRight(logFilter == "enemy" and (#enemy.log .. " entries") or (#visits .. " visits"), W - pad, top + (chipH - small) / 2, MUTED, small)
   local listTop = top + chipH + pad / 2
 
   local cutoff = 0
   if logFilter == "today" then cutoff = dayStart(now())
   elseif logFilter == "week" then cutoff = dayStart(now()) - 6 * 86400 end
 
-  local counts = {}
   local items = {}
   local lastDay = nil
+  if logFilter == "enemy" then
+    for i = #enemy.log, 1, -1 do
+      local e = enemy.log[i]
+      local d = dayLabel(e.t)
+      if d ~= lastDay then
+        table.insert(items, sectionItem(d:upper(), MUTED, small, pad))
+        lastDay = d
+      end
+      table.insert(items, { h = small + 14, draw = function(y)
+        if i % 2 == 0 then rect(pad, y, W - pad * 2 - 8, small + 12, { 20, 23, 29 }) end
+        text(timeOfDay(e.t), pad * 1.4, y + 6, MUTED, small)
+        text(fit(e.name, W * 0.36, small, "bold"), pad * 1.4 + textWidth("00:00  ", small), y + 6, WHITE, small, "bold")
+        if e.kind == "join" then
+          textRight("joined", W - pad * 2 - 8, y + 6, RED, small, "bold")
+        else
+          textRight("left after " .. fmtDuration(e.t - (e.since or e.t)), W - pad * 2 - 8, y + 6, AMBER, small)
+        end
+      end })
+    end
+    for _, sess in pairs(enemy.sessions) do
+      table.insert(items, 1, { h = small + 14, draw = function(y)
+        rect(pad, y, W - pad * 2 - 8, small + 12, { 70, 30, 30 })
+        text(fit(sess.name .. " ONLINE NOW", W * 0.6, small, "bold"), pad * 1.4, y + 6, WHITE, small, "bold")
+        textRight("for " .. fmtDuration(now() - sess.since), W - pad * 2 - 8, y + 6, AMBER, small, "bold")
+      end })
+    end
+    if #items == 0 then
+      table.insert(items, { h = medium + pad, draw = function(y) text("No enemy joins logged yet", pad * 1.4, y + 6, MUTED, medium) end })
+    end
+    scrollList("log", pad, listTop, W - pad * 2 - 8, bottom, items)
+    return
+  end
   for i = #visits, 1, -1 do
     local v = visits[i]
     if v.first >= cutoff then
@@ -2066,8 +2147,8 @@ local function drawPeopleTab(y)
   y = y + 1
   local enemies = {}
   for _, n in ipairs(WATCH_JOINS) do
-    local on = watchedOnline[n:lower()] ~= nil
-    table.insert(enemies, n .. (on and " (ONLINE)" or ""))
+    local sess = enemy.sessions[n:lower()]
+    table.insert(enemies, n .. (sess and (" (ONLINE since " .. os.date("!%H:%M", math.floor(sess.since + UTC_OFFSET * 3600)) .. ")") or ""))
   end
   put(2, y, (#enemies > 0 and table.concat(enemies, ", ") or "none"):sub(1, TW - 2), #enemies > 0 and colors.red or colors.gray)
 end
