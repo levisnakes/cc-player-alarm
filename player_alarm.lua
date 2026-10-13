@@ -121,6 +121,7 @@ local detector, chat, speaker
 -- Create Radar: any radar bearing, plane radar or radar monitor on the
 -- computer or its cable. Found again whenever peripherals change.
 local radars = {}
+local updateNow = { want = false, busy = false }  -- UPDATE button -> updater
 local radarRange = 0
 
 local radarHasPosition = {}
@@ -1560,13 +1561,14 @@ end
 local function drawRadarPage(top, bottom, pad, small, medium)
   local y = top
   local tbH = small + pad
-  local bw = math.floor((W - pad * 2 - pad * 3) / 4)
+  local gap = pad * 0.6
+  local bw = math.floor((W - pad * 2 - gap * 4) / 5)
   local x = pad
   local BTN = nil
   pill(x, y, bw, tbH, "-", BTN, WHITE, medium, function() zoomStep(-1) end)
-  x = x + bw + pad
+  x = x + bw + gap
   pill(x, y, bw, tbH, "+", BTN, WHITE, medium, function() zoomStep(1) end)
-  x = x + bw + pad
+  x = x + bw + gap
   local m = currentMode()
   pill(x, y, bw, tbH, m:upper(), nil, #radars > 0 and WHITE or MUTED, small * 0.85, function()
     if #radars == 0 then
@@ -1578,7 +1580,7 @@ local function drawRadarPage(top, bottom, pad, small, medium)
     mode = MODES[idx % #MODES + 1]
     writeFile(DIR .. "/mode", mode)
   end)
-  x = x + bw + pad
+  x = x + bw + gap
   if muted() then
     local left = math.ceil(muteUntil - now())
     pill(x, y, bw, tbH, string.format("%d:%02d", math.floor(left / 60), left % 60), AMBER, BG, small, function()
@@ -1595,6 +1597,12 @@ local function drawRadarPage(top, bottom, pad, small, medium)
       end
     end)
   end
+  x = x + bw + gap
+  pill(x, y, bw, tbH, updateNow.busy and "..." or "UPDATE", nil, WHITE, small * 0.85, function()
+    if updateNow.busy or updateNow.want then return end
+    updateNow.want = true
+    event("Checking for updates...", "info")
+  end)
   y = y + tbH + pad
 
   -- summary line under the radar
@@ -2553,23 +2561,26 @@ local function writeText(path, text)
   f.close()
 end
 
-local function checkForUpdate(atBoot)
-  if AUTO_UPDATE == false or not http then return end
+-- Returns why nothing was installed; on success the computer reboots.
+local function checkForUpdate(atBoot, manual)
+  if not http then return "HTTP is off" end
+  if AUTO_UPDATE == false and not manual then return "off" end
   local sha = fetch("https://api.github.com/repos/" .. UPDATE_REPO .. "/commits/main",
     { ["Accept"] = "application/vnd.github.sha", ["User-Agent"] = "cc-auto-update" })
-  if not sha then return end
+  if not sha then return "GitHub unreachable (try again in a bit)" end
   sha = sha:match("^%s*(%x+)%s*$")
-  if not sha or #sha < 40 or readText(SHA_FILE) == sha then return end
+  if not sha or #sha < 40 then return "GitHub gave a bad answer" end
+  if readText(SHA_FILE) == sha then return "already up to date" end
 
   local newSrc = fetch("https://raw.githubusercontent.com/" .. UPDATE_REPO .. "/" .. sha .. "/" .. UPDATE_FILE)
-  if not newSrc or not _G.load(newSrc, UPDATE_FILE) then return end
+  if not newSrc or not _G.load(newSrc, UPDATE_FILE) then return "download failed" end
   local oldSrc = readText(PROGRAM_PATH)
-  if not oldSrc then return end
+  if not oldSrc then return "can't read " .. PROGRAM_PATH end
   local merged = mergeSettings(oldSrc, newSrc)
-  if not _G.load(merged, UPDATE_FILE) then return end
+  if not _G.load(merged, UPDATE_FILE) then return "new version failed to load" end
   if merged == oldSrc then
     writeText(SHA_FILE, sha)
-    return
+    return "already up to date"
   end
 
   -- at boot nothing is running yet, so there is nothing to wait for
@@ -2586,9 +2597,20 @@ local function checkForUpdate(atBoot)
 end
 
 function updateLoop()
+  local waited = 0
   while true do
-    sleep(UPDATE_CHECK_MINUTES * 60)
-    pcall(checkForUpdate)
+    sleep(1)
+    waited = waited + 1
+    if updateNow.want then
+      updateNow.want, updateNow.busy = false, true
+      local ok, why = pcall(checkForUpdate, false, true)
+      updateNow.busy = false
+      event("Update: " .. tostring(ok and why or "error, " .. tostring(why)), "info")
+      waited = 0
+    elseif waited >= UPDATE_CHECK_MINUTES * 60 then
+      pcall(checkForUpdate)
+      waited = 0
+    end
   end
 end
 
