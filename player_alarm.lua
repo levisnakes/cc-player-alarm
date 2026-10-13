@@ -1088,6 +1088,10 @@ local function hovered(x, y, w, h)
   return now() - hover.at < 1.5 and hover.x >= x and hover.x <= x + w and hover.y >= y and hover.y <= y + h
 end
 
+local scroll = { people = 0, log = 0, stats = 0 }
+local drawGpu, findMonitor, setupGpu
+do
+
 -- Phosphor screen: green on near-black, amber for warnings, red for alarms.
 local FONT = "Monospaced"
 local BG = { 3, 9, 5 }
@@ -1134,7 +1138,7 @@ local function mix(a, b, t)
   return { I(a[1] + (b[1] - a[1]) * t), I(a[2] + (b[2] - a[2]) * t), I(a[3] + (b[3] - a[3]) * t) }
 end
 
-local function findMonitor()
+function findMonitor()
   if MONITOR then return MONITOR end
   local best, area = nil, 0
   for _, name in ipairs(peripheral.getNames()) do
@@ -1146,7 +1150,7 @@ local function findMonitor()
   return best
 end
 
-local function setupGpu()
+function setupGpu()
   gpu = peripheral.find("directgpu")
   local mon = findMonitor()
   if not gpu then gpuError = "no DirectGPU block found" return false end
@@ -1498,9 +1502,6 @@ local function drawDetails(e, x, bottom, w, small, medium)
 end
 
 -- Pages live in a block so their helpers stay out of the top-level local count.
-local scroll = { people = 0, log = 0, stats = 0 }
-local drawGpu
-do
 -- ---------------------------------------------------------------- pages, scrolling, hover
 
 local PAGES = { { "radar", "RADAR" }, { "people", "PEOPLE" }, { "log", "LOG" }, { "stats", "STATS" } }
